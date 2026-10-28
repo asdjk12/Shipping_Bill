@@ -1,0 +1,3 @@
+# Python bytecode caches are generated locally and must not be versioned.
+__pycache__/
+*.py[cod]

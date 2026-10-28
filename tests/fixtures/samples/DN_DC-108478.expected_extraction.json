@@ -1,0 +1,76 @@
+{
+  "source_id": "DN_DC-108478.pdf",
+  "document_type_raw": "DEBIT NOTE",
+  "reference_no": "DC-108478",
+  "document_date_raw": "10-24-2026",
+  "due_date_raw": "10-24-2026",
+  "issuer": "Pilot Aiship Tech co., Ltd.",
+  "recipient": null,
+  "payee": "NEPTUNE SHIPPING LIMITED (LAX)",
+  "payer": null,
+  "master_bl_no": "MAEU275752922",
+  "house_bl_no": "CGT260801188",
+  "booking_no": null,
+  "container_nos": ["MRSU2571577", "TCLU8619685"],
+  "other_references": [
+    {"label": "OUR FILE NO.", "value": "OI-26090566"},
+    {"label": "AGENT FILE NO.", "value": "CGTSE260801188"}
+  ],
+  "vessel_voyage": "MARGRETHE MAERSK 635W",
+  "port_of_loading": "QINGDAO LIUTING INTERNATIONAL APT (CHINA)",
+  "port_of_discharge": "SAVANNAH, GA (UNITED STATES)",
+  "place_of_payment": null,
+  "currency_raw": "USD",
+  "credit_terms_raw": "COD",
+  "charges": [
+    {
+      "line_no": 1,
+      "charge_name_raw": "HANDLING CHARGE",
+      "basis_raw": "-",
+      "quantity": 1.00,
+      "unit_price": 65.00,
+      "amount": 65.00,
+      "currency_raw": null,
+      "dc_direction": "DEBIT",
+      "payment_term_raw": "C"
+    },
+    {
+      "line_no": 2,
+      "charge_name_raw": "4 ADD'L DETENTION FREE TIME CHARGE",
+      "basis_raw": "-",
+      "quantity": 1.00,
+      "unit_price": "1,310.40",
+      "amount": "1,310.40",
+      "currency_raw": null,
+      "dc_direction": "DEBIT",
+      "payment_term_raw": "C"
+    },
+    {
+      "line_no": 3,
+      "charge_name_raw": "HANDLING CHARGE",
+      "basis_raw": "-",
+      "quantity": 1.00,
+      "unit_price": 35.00,
+      "amount": 35.00,
+      "currency_raw": null,
+      "dc_direction": "DEBIT",
+      "payment_term_raw": "C"
+    }
+  ],
+  "totals": [
+    {
+      "currency_raw": "USD",
+      "total_amount": "1,410.40",
+      "total_debit": 1410.40,
+      "total_credit": 0,
+      "paid_amount": 0.00,
+      "balance_due": "1,410.40"
+    }
+  ],
+  "change_instructions": [],
+  "evidence": {
+    "reference_no": {"source_id": "DN_DC-108478.pdf", "quote": "D/C No. : DC-108478"},
+    "payee": {"source_id": "DN_DC-108478.pdf", "quote": "GRAND TOTAL BALANCE DUE TO NEPTUNE SHIPPING LIMITED (LAX)"},
+    "credit_terms_raw": {"source_id": "DN_DC-108478.pdf", "quote": "TERMS COD"}
+  }
+}

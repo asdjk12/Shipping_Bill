@@ -1,0 +1,61 @@
+{
+  "source_id": "INV_ZIM_ORFR1618731.png",
+  "document_type_raw": "DEBIT INVOICE",
+  "reference_no": "ORFR1618731",
+  "document_date_raw": "10/03/2025",
+  "due_date_raw": null,
+  "issuer": "ZIM AMERICAN INTEGRATED SHIPPING SERVICES CO. LLC AS AGENTS FOR ZIM INTEGRATED SHIPPING SERVICES LTD",
+  "recipient": "ALL AMERICA FORWARDING, INC.",
+  "payee": "Zim American Integrated Shipping Services Co., LLC As Agents for Zim Integrated Shipping Services Ltd.",
+  "payer": "USIAHALLAM",
+  "master_bl_no": "ZIMUNGB1312144",
+  "house_bl_no": null,
+  "booking_no": "ZIMUNGB1312144",
+  "container_nos": ["JXLU4504463"],
+  "other_references": [],
+  "vessel_voyage": "MSC ELODIE VOY 2/E",
+  "port_of_loading": "NINGBO (ZJ)",
+  "port_of_discharge": "PORT EVERGLADES (FL)",
+  "place_of_payment": "USORF",
+  "currency_raw": null,
+  "credit_terms_raw": "PAY IMMEDIATELY",
+  "charges": [
+    {
+      "line_no": 1,
+      "charge_name_raw": "WHARFAGE ADMINISTRATION FEE",
+      "basis_raw": "C",
+      "quantity": null,
+      "unit_price": 5.00,
+      "amount": 5.00,
+      "currency_raw": "USD",
+      "dc_direction": null,
+      "payment_term_raw": null,
+      "exchange_rate": 1.0000,
+      "local_amount": 5.00,
+      "local_currency_raw": "USD"
+    },
+    {
+      "line_no": 2,
+      "charge_name_raw": "WHARFAGE",
+      "basis_raw": "PTT",
+      "quantity": null,
+      "unit_price": 2.85,
+      "amount": 21.90,
+      "currency_raw": "USD",
+      "dc_direction": null,
+      "payment_term_raw": null,
+      "exchange_rate": 1.0000,
+      "local_amount": 21.90,
+      "local_currency_raw": "USD"
+    }
+  ],
+  "totals": [
+    {"currency_raw": "USD", "total_amount": 26.90}
+  ],
+  "change_instructions": [],
+  "evidence": {
+    "reference_no": {"source_id": "INV_ZIM_ORFR1618731.png", "quote": "DEBIT INVOICE: ORFR1618731"},
+    "payee": {"source_id": "INV_ZIM_ORFR1618731.png", "quote": "All payments must be issued to:"},
+    "document_date_raw": {"source_id": "INV_ZIM_ORFR1618731.png", "quote": "Invoice date 10/03/2025"}
+  }
+}
