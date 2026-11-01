@@ -5,6 +5,9 @@ description = "航运智能账单助手 Agent"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.6",
+    "openpyxl>=3.1",
+    "python-docx>=1.1",
+    "xlrd>=2.0",          # .xls；未安装时回退到 LibreOffice 转换
 ]
 
 [project.optional-dependencies]

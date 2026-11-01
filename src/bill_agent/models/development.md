@@ -1,6 +1,6 @@
 # 航运智能账单助手 Agent：开发文档
 
-> 版本：v0.1（草案）｜ 日期：2026-10-28 ｜ 依据：test.pdf（AI agent 笔试题，最新版）
+> 版本：v0.2（草案）｜ 日期：2026-11-01 ｜ 依据：test.pdf（AI agent 笔试题，最新版）
 
 ---
 
@@ -9,7 +9,7 @@
 航运和货代业务的费用信息散落在邮件、PDF 账单、扫描件、Excel 和 Word 中。本项目要开发一个 Agent，能自动完成以下工作：
 
 1. 解析多种格式的输入（EML / PDF / 图片 / Excel / Word / 已有账单 JSON）；
-2. 识别 PDF 和图片时，调用题目指定的 OCR API；
+2. PDF 和图片登记为待 OCR，由视觉模型 OCR 服务补充文本和表格；
 3. 抽取单据和费用明细，并对费用名称、币种、付款方式做标准化；
 4. 与已有账单做匹配，判定新增、更新、无变化或待人工复核；
 5. 从记账主体的视角判断 AR/AP；
@@ -25,7 +25,7 @@
 | 验收标准 | 负责模块 | 章节 |
 |---|---|---|
 | 1. 解析 EML 正文及附件 | `parsers/eml.py` + Router 递归 | 6.1 |
-| 2. 调用 OCR 识别 PDF 和图片 | `ocr/client.py` + `ocr/hosting.py` | 6.2 |
+| 2. 调用 OCR 识别 PDF 和图片 | `parsers/pdf_image.py`（登记）+ `ocr/interface.py`（视觉模型接入） | 6.1、6.2 |
 | 3. 解析 Excel 和 Word 中的费用表格 | `parsers/excel.py`、`parsers/word.py` | 6.1 |
 | 4. 提取单据编号、费用、金额、币种 | `extract/` (LLM 结构化抽取) | 6.3 |
 | 5. 区分新增账单与更新账单 | `billing/matcher.py`、`billing/operation.py` | 6.6、6.7 |
@@ -49,7 +49,6 @@
 | Word | `python-docx`；.doc 先用 LibreOffice 转换 | |
 | 本地数据库 | SQLite（`sqlite3` 或 SQLModel） | 轻量，支持索引和事务 |
 | 模糊匹配 | `rapidfuzz` | 用于公司名（记账主体别名）匹配 |
-| HTTP | `requests` / `httpx` + `tenacity` 重试 | |
 | 测试 | `pytest` | |
 | 配置 | `pydantic-settings` + `.env` / YAML | |
 
@@ -62,7 +61,8 @@ flowchart LR
     IN[输入文件] --> R{Parser Router}
     R -->|.eml| EML[EML 解析]
     EML -->|附件| R
-    R -->|.pdf/.jpg/.png/.tiff| OCR[OCR API]
+    R -->|.pdf/.jpg/.png/.tiff| PEND[登记 pending_ocr]
+    PEND --> OCR[视觉模型 OCR]
     R -->|.xls/.xlsx| XL[Excel 解析]
     R -->|.doc/.docx| WD[Word 解析]
     R -->|existing .json| DB[(账单库 SQLite)]
@@ -109,14 +109,19 @@ shipping-bill-agent/
 │   │   ├── bill.py            # BillRecord（数据库记录）
 │   │   └── output.py          # 标准输出格式
 │   ├── parsers/
+│   │   ├── detect.py          # 文件头识别类型
 │   │   ├── router.py
 │   │   ├── eml.py
+│   │   ├── html_text.py       # HTML 正文 → 文本 + 表格
 │   │   ├── excel.py
 │   │   ├── word.py
-│   │   └── pdf_image.py       # 调用 ocr/
+│   │   ├── convert.py         # LibreOffice 转换 .doc/.xls
+│   │   ├── table_utils.py     # 表头定位
+│   │   ├── blob_store.py      # 原文件存档
+│   │   ├── json_bill.py
+│   │   └── pdf_image.py       # 登记为 pending_ocr
 │   ├── ocr/
-│   │   ├── client.py          # OCR API 调用、重试、缓存
-│   │   └── hosting.py         # 本地文件 → 可访问 URL
+│   │   └── interface.py       # OCR 接入接口（视觉模型实现待补充）
 │   ├── extract/
 │   │   ├── prompts.py
 │   │   └── extractor.py
@@ -156,43 +161,80 @@ shipping-bill-agent/
 
 ### 6.1 多格式解析（Parser Router）
 
-统一输出 `RawDocument`：
+**状态：已实现**，代码在 `src/bill_agent/parsers/`。这一层只规定各类文件怎么进来、进来之后怎么处理，统一产出 `RawDocument`（定义在 `models/raw.py`），不提取任何业务字段。
 
-```python
-class RawDocument(BaseModel):
-    source_id: str              # 唯一ID（文件哈希）
-    source_path: str            # 来源路径；附件形如 "mail.eml#attachments/DN.pdf"
-    parent_id: str | None       # EML 附件指向邮件
-    file_type: Literal["eml","pdf","image","excel","word","text"]
-    text: str                   # 全文文本
-    tables: list[list[list[str]]]  # 表格（行 × 列）
-    meta: dict                  # 邮件头、sheet 名、OCR 置信度等
+**各类输入的去向：**
+
+| 输入 | 处理 | 产出状态 |
+|---|---|---|
+| EML | 解析邮件头和正文（text/plain 优先，表格从 text/html 中提取）；每个附件送回 Router 递归处理；转发邮件（message/rfc822）同样递归 | `parsed` |
+| Excel（.xlsx / .xls） | 读取每个可见工作表，展开合并单元格，定位表头；表头以上的内容保留在 text 中 | `parsed` |
+| Word（.docx / .doc） | 按文档顺序提取段落和表格；页眉、页脚、文本框的内容也收进来 | `parsed` |
+| PDF / 图片 | **只登记，不识别**：原文件按内容哈希存档（`file_ref`），text 留空 | `pending_ocr` |
+| 已有账单 JSON | 原样交给账单库模块，不生成 RawDocument | — |
+| 其他（txt、zip 等） | 记入 `skipped` 并写明原因 | — |
+
+**RawDocument 的状态：**
+
+```
+EML / Excel / Word ──解析──▶ parsed ─────────────────┐
+PDF / 图片 ──登记──▶ pending_ocr ──OCR 成功──▶ ocr_done ──┼──▶ 进入 LLM 抽取
+                              └─OCR 失败──▶ ocr_failed ─┘（不进入抽取，可重试）
 ```
 
-| 类型 | 处理方式 |
-|---|---|
-| EML | 解析 Subject / From / To / Date / Body（优先取 text/plain，没有则把 HTML 转成文本）；对每个附件按扩展名或 MIME 类型**递归**调用 Router；嵌套的 `.eml`（message/rfc822）同样递归 |
-| PDF / 图片 | 调用 OCR（6.2）。题目明确要求 PDF 走 OCR API。如果是文本型 PDF，可以额外用 `pdfplumber` 抽一份文本做交叉校验（可选） |
-| Excel | 遍历所有 sheet。自动定位表头行：扫描前 N 行，找命中“Charge/Description/Amount/Currency”等关键词最多的一行。合并单元格要展开 |
-| Word | 正文段落加全部表格，.doc 先转成 .docx |
-| JSON | 识别为已有账单，导入账单库，不进入抽取流程 |
+状态和字段必须一致，否则模型直接报错：
 
-邮件正文本身也可能就是一份对账或改账说明（例如“请将 Handling Fee 改为 USD 40”），所以**正文也会作为一份 RawDocument 进入抽取流程**。
+- PDF 和图片不能是 `parsed`；其他类型只能是 `parsed`。
+- `pending_ocr` 时必须有 `file_ref`，text 和 tables 必须为空。
+- `ocr_done` 时必须记录 `ocr_engine`，text 和 tables 不能同时为空。
+- `ocr_failed` 时必须记录 `ocr_error`；原文件引用保留，方便重试。
+- 只有 `parsed` 和 `ocr_done` 的文档会进入抽取（`ready_for_extraction`）。
+
+**模块职责：**
+
+| 模块 | 职责 |
+|---|---|
+| `detect.py` | 以文件头（magic bytes）为主识别类型，扩展名和 MIME 只做兜底，所以附件扩展名错了也能识别（例如实际是 PDF 的 `DN.dat`）；同时给出正确的扩展名和 MIME |
+| `router.py` | 分发到对应解析器；内容相同（sha256 相同）的文件只处理一次；单个文件失败只记入 `skipped`，不中断整批；嵌套层数上限 5；补齐文件名、MIME、大小 |
+| `eml.py` | charset 异常时逐级降级；正文中内嵌的小图片（<20KB，通常是 logo）不登记 |
+| `excel.py` / `word.py` | .xls / .doc 优先用 xlrd 读取，否则用 LibreOffice 转换；合并单元格展开为重复值，保证每列和表头对齐 |
+| `table_utils.py` | 定位表头：在前 30 行里，取命中关键词的**不同值**最多、且**不含数字单元格**的那一行 |
+| `blob_store.py` | 按内容寻址保存原文件（`<sha256>.<真实扩展名>`） |
+| `json_bill.py` | 已有账单 JSON 支持 `[...]`、`{"bills"/"records"/"data": [...]}` 和单个对象三种结构 |
+
+邮件正文本身也可能就是一份对账单或改账说明（例如“请将 Handling Fee 改为 USD 40”），所以**正文也作为一份 RawDocument 进入抽取流程**。
+
+**用来检查解析效果的命令：**
+
+```bash
+python -m bill_agent parse <文件或目录>... [--blob-dir data/blobs] [--out parsed.json]
+```
 
 ### 6.2 OCR 服务
 
-接口（最新版）：
+**状态：只定义了接口，OCR 由视觉模型实现（待补充）。** 接口在 `src/bill_agent/ocr/interface.py`：
 
 ```python
-POST https://gateway.pltplt.com/ai/process
-json = {"file": <可访问的文件URL>, "task": "orderChange", "callBack": "", "taskType": ""}
-timeout = (10, 300)
+class OCRBackend(Protocol):
+    name: str                                                    # 记入 RawDocument.ocr_engine
+    def recognize(self, doc: RawDocument, data: bytes) -> OCRResult: ...
+
+@dataclass
+class OCRResult:
+    text: str
+    tables: list[list[list[str | None]] | RawTable] = []         # 二维表格即可，表头由统一逻辑定位
+    confidence: float | None = None                              # 0~1
+    raw_response: dict | None = None                             # 模型原始输出，用于审计
+    warnings: list[str] = []
+
+docs = run_ocr(parse_result.documents, backend)
 ```
 
-- **文件托管（`hosting.py`）**：OCR 只接受 URL，所以本地文件要先上传到对象存储（OSS/S3/COS）并生成临时签名 URL。开发阶段可以用临时文件服务。**这一步优先打通。**
-- **重试**：用 `tenacity` 做指数退避，只重试网络错误和 5xx。
-- **缓存**：以文件 SHA256 为 key 缓存 OCR 结果，避免重复调用和重复计费，也方便离线调试和回归测试。
-- **响应适配**：OCR 返回的结构需要拿真实样例确认（见第 11 章）。适配层统一转换成 `RawDocument`，保留原始响应以便审计。如果响应里有置信度，就写入 `meta`。
+`run_ocr` 只处理 `pending_ocr` 和 `ocr_failed` 状态的文档，从 `file_ref` 读取原文件交给模型。识别成功调用 `complete_ocr()` 转为 `ocr_done`，抛出异常则调用 `fail_ocr()` 转为 `ocr_failed`。其他文档原样返回，顺序不变。
+
+实现视觉模型时可以利用：`doc.mime_type`（`application/pdf`、`image/png` 等，按真实内容识别）、`doc.file_name`，以及 `doc.parent_id` 对应的邮件上下文。
+
+题目原本指定的 OCR API（`https://gateway.pltplt.com/ai/process`，要求传入公网可访问的文件 URL）如果后续还要接入，也按同一个接口实现即可。
 
 ### 6.3 信息抽取（LLM）
 
@@ -467,7 +509,7 @@ stateDiagram-v2
 | 节点 | 实现 | 是否调用 LLM |
 |---|---|---|
 | parse | Router | 否 |
-| ocr | OCR client | 否 |
+| ocr | `run_ocr` + 视觉模型（只处理 pending_ocr / ocr_failed） | 视觉模型 |
 | extract | 结构化抽取（把校验错误作为反馈带入下一次重试） | **是** |
 | normalize | 查表（只改写标准化表中的名称） | 否 |
 | validate | 规则校验 + 证据溯源 | 否 |
@@ -506,14 +548,11 @@ stateDiagram-v2
 accounting_entity:
   name: "Origin Agent"
   role: "origin"            # origin / destination / null
+parse:
+  blob_dir: "data/blobs"    # PDF / 图片原文件存档
+  max_depth: 5
 ocr:
-  endpoint: "https://gateway.pltplt.com/ai/process"
-  task: "orderChange"
-  timeout: [10, 300]
-  max_retries: 3
-hosting:
-  provider: "s3"            # s3 / oss / local_tunnel
-  url_expire_seconds: 3600
+  engine: "..."             # 视觉模型，待定
 llm:
   provider: "openai"        # 待定
   model: "..."
@@ -541,8 +580,8 @@ python -m bill_agent run \
 
 | 阶段 | 内容 | 产出 |
 |---|---|---|
-| M0 | 下载样例数据；**打通 OCR（含文件托管）**；确认 OCR 响应格式 | OCR 适配层、样例缓存 |
-| M1 | 数据模型；EML / Excel / Word 解析器；Router 递归 | 解析器 + 单元测试 |
+| M0 | 下载样例数据；OCR 接口约定（视觉模型实现待补充） | `ocr/interface.py` ✅ |
+| M1 | 数据模型；EML / Excel / Word 解析器；Router 递归；PDF / 图片登记为待 OCR | 解析器 + 单元测试 ✅ |
 | M2 | LLM 结构化抽取 + 证据；标准化模块 | 抽取结果达到可用水平 |
 | M3 | 校验模块；SQLite 账单库；JSON 导入 | |
 | M4 | 4 级匹配；操作判定；字段级 diff；AR/AP 规则 | 核心业务闭环 |
@@ -553,12 +592,11 @@ python -m bill_agent run \
 
 ## 11. 待确认问题
 
-1. **OCR 响应格式**：`task: orderChange` 返回的是纯文本/表格，还是已经结构化的字段？是否带置信度？需要用样例实测。
-2. **文件托管方式**：OCR 服务只能访问 URL，需要确定用哪种对象存储或公网文件服务。
-3. **记账主体从哪里来**：是每次运行时指定，还是从已有账单 JSON 或邮件收件方推断？本方案默认由外部配置。
-4. **样例数据**：已有账单 JSON 的字段结构需要对照样例确认，并据此调整 `bill_records` 的映射。
-5. **LLM 选型**：没有指定，需要支持结构化输出（function calling 或 JSON mode）。
-6. **扩展字段**：输出中加入扩展字段是否会影响评测，是否需要严格只输出样例中的字段。
+1. **OCR**：改为由视觉模型按 `OCRBackend` 接口实现（待补充）。
+2. **记账主体从哪里来**：是每次运行时指定，还是从已有账单 JSON 或邮件收件方推断？本方案默认由外部配置。
+3. **样例数据**：已有账单 JSON 的字段结构需要对照样例确认，并据此调整 `bill_records` 的映射。
+4. **LLM 选型**：没有指定，需要支持结构化输出（function calling 或 JSON mode）。
+5. **扩展字段**：输出中加入扩展字段是否会影响评测，是否需要严格只输出样例中的字段。
 
 ---
 

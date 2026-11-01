@@ -22,6 +22,20 @@ class FileType(str, Enum):
     BILL_JSON = "bill_json"  # 已存在的账单 JSON
 
 
+class DocStatus(str, Enum):
+    """RawDocument 的处理状态。
+
+        EML / Excel / Word / 纯文本 ──解析──▶ PARSED ─────────────┐
+        PDF / 图片 ──登记──▶ PENDING_OCR ──OCR 成功──▶ OCR_DONE ──┼──▶ 进入 LLM 抽取
+                                        └─OCR 失败──▶ OCR_FAILED ─┘（不进入抽取，可重试）
+    """
+
+    PARSED = "parsed"            # 文本已就绪，无需 OCR
+    PENDING_OCR = "pending_ocr"  # 等待 OCR 服务补充 text / tables
+    OCR_DONE = "ocr_done"        # OCR 已补充完成
+    OCR_FAILED = "ocr_failed"    # OCR 失败，可重新提交
+
+
 class DocumentType(str, Enum):
     DEBIT_NOTE = "Debit Note"
     CREDIT_NOTE = "Credit Note"

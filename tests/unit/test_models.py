@@ -136,5 +136,5 @@ def test_extracted_charge_amount_from_string():
 
 
 def test_raw_document_minimal():
-    d = RawDocument(source_id="abc", source_path="mail.eml#attachments/DN.pdf", file_type=FileType.PDF)
-    assert d.tables == [] and d.email is None
+    d = RawDocument(source_id="abc", source_path="charges.xlsx", file_type=FileType.EXCEL)
+    assert d.tables == [] and d.email is None and d.ready_for_extraction
