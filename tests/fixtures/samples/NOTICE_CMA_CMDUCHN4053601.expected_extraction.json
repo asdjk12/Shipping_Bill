@@ -1,0 +1,47 @@
+{
+  "source_id": "PDF示例账单1.pdf",
+  "document_type_raw": "GENERAL NOTICE",
+  "reference_no": null,
+  "document_date_raw": "10/19/2026 05:58 PM",
+  "due_date_raw": null,
+  "issuer": "CMA CGM (AMERICA) LLC",
+  "recipient": "NEPTUNE SHIPPING LIMITED",
+  "payee": "CMA CGM (AMERICA) LLC",
+  "payer": null,
+  "master_bl_no": "CMDUCHN4053601",
+  "house_bl_no": null,
+  "booking_no": null,
+  "container_nos": ["SAPU2040689"],
+  "other_references": [],
+  "vessel_voyage": "CMA CGM LYRA MTE070W19",
+  "port_of_loading": "SHANGHAI",
+  "port_of_discharge": "LOS ANGELES, CA",
+  "place_of_payment": null,
+  "currency_raw": "USD",
+  "credit_terms_raw": null,
+  "charges": [
+    {
+      "line_no": 1,
+      "charge_name_raw": "On Carriage Additional - US Em",
+      "charge_code_raw": "OCA17",
+      "basis_raw": null,
+      "quantity": null,
+      "unit_price": null,
+      "amount": 245.0000,
+      "currency_raw": "USD",
+      "dc_direction": null,
+      "payment_term_raw": "C",
+      "container_no": null
+    }
+  ],
+  "totals": [
+    {"currency_raw": "USD", "total_amount": 245.0000}
+  ],
+  "change_instructions": [],
+  "evidence": {
+    "document_type_raw": {"source_id": "PDF示例账单1.pdf", "quote": "GENERAL NOTICE"},
+    "master_bl_no": {"source_id": "PDF示例账单1.pdf", "quote": "CMDUCHN4053601"},
+    "payee": {"source_id": "PDF示例账单1.pdf", "quote": "CMA CGM (AMERICA) LLC"},
+    "recipient": {"source_id": "PDF示例账单1.pdf", "quote": "NEPTUNE SHIPPING LIMITED"}
+  }
+}

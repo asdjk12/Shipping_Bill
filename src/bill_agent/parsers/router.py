@@ -39,20 +39,29 @@ class Router:
     # ---------- 入口 ----------
 
     def route_paths(self, paths: list[str | Path]) -> ParseResult:
-        """处理磁盘上的文件或目录（目录递归展开，按文件名排序保证结果可复现）。"""
+        """处理磁盘上的文件或目录（目录递归展开，按文件名排序保证结果可复现）。
+
+        source_path 使用相对路径并统一用 "/" 分隔，不依赖本机目录和操作系统：
+        - 传入目录：相对于该目录，如 "sub/DN.pdf"
+        - 传入单个文件：只用文件名，如 "DN.pdf"
+        - 邮件附件在此基础上追加 "#attachments/<文件名>"
+        """
         result = ParseResult()
         for p in paths:
             p = Path(p)
-            files = sorted(x for x in p.rglob("*") if x.is_file()) if p.is_dir() else [p]
-            for fp in files:
+            if p.is_dir():
+                files = [(x, x.relative_to(p).as_posix()) for x in sorted(p.rglob("*")) if x.is_file()]
+            else:
+                files = [(p, p.name)]
+            for fp, rel in files:
                 if fp.name.startswith("."):
                     continue
                 try:
                     data = fp.read_bytes()
                 except OSError as e:
-                    result.skipped.append(SkippedItem(str(fp), f"无法读取文件: {e}"))
+                    result.skipped.append(SkippedItem(rel, f"无法读取文件: {e}"))
                     continue
-                result.extend(self.route(InputFile(data=data, name=fp.name, source_path=str(fp))))
+                result.extend(self.route(InputFile(data=data, name=fp.name, source_path=rel)))
         return result
 
     def route(self, f: InputFile) -> ParseResult:

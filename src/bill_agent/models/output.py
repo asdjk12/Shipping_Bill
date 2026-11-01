@@ -42,6 +42,7 @@ class ChargeDetails(StrictModel):
     payment_term: PaymentTerm | None = None
     # [扩展] 四.3 同时保存原始费用名称；四.2 数量、单价；样例中的借贷方向与汇率
     original_charge_item: str | None = None
+    charge_code: str | None = None
     line_no: int | None = None
     basis: str | None = None
     quantity: Amount | None = None
@@ -106,6 +107,7 @@ class OutputRecord(StrictModel):
                 currency=rec.currency,
                 payment_term=rec.payment_term,
                 original_charge_item=rec.original_charge_item,
+                charge_code=rec.charge_code,
                 line_no=rec.line_no,
                 basis=rec.basis,
                 quantity=rec.quantity,

@@ -193,8 +193,23 @@ def test_route_directory(tmp_path, router, xlsx_bytes, docx_bytes):
     (sub / ".DS_Store").write_bytes(b"junk")
     (tmp_path / "in" / "empty.pdf").write_bytes(b"")
     r = router.route_paths([tmp_path / "in"])
-    assert sorted(Path(d.source_path).name for d in r.documents) == ["a.xlsx", "b.docx"]
-    assert [Path(s.source_path).name for s in r.skipped] == ["empty.pdf"]
+    # source_path 相对于输入目录，统一用 "/"，不含本机绝对路径
+    assert sorted(d.source_path for d in r.documents) == ["a.xlsx", "sub/b.docx"]
+    assert [s.source_path for s in r.skipped] == ["empty.pdf"]
+
+
+def test_source_path_single_file_and_attachments(tmp_path, router, eml_bytes):
+    mail_dir = tmp_path / "笔试题" / "邮件"
+    mail_dir.mkdir(parents=True)
+    (mail_dir / "update.eml").write_bytes(eml_bytes)
+    r = router.route_paths([mail_dir / "update.eml"])          # 传入单个文件
+    paths = {d.source_path for d in r.documents}
+    assert "update.eml" in paths
+    assert "update.eml#attachments/charges.xlsx" in paths
+    assert all(str(tmp_path) not in p and "\\" not in p for p in paths)
+
+    r2 = build_default_router(RouterConfig(blob_dir=str(tmp_path / "b2"))).route_paths([tmp_path / "笔试题"])
+    assert "邮件/update.eml" in {d.source_path for d in r2.documents}
 
 
 def test_key_value_row_is_not_header():

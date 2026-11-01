@@ -47,6 +47,7 @@ class ChargeRecord(StrictModel):
         description="费用名称：命中四.3 标准化表时为标准名，否则原样照抄原始名称（不做改写）",
     )
     original_charge_item: str = Field(min_length=1, description="原始费用名称")
+    charge_code: str | None = None
     basis: str | None = None
     quantity: Amount | None = None
     unit_price: Amount | None = None

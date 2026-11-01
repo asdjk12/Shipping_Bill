@@ -23,6 +23,8 @@
       行上无币种仅表头有 CURRENCY。
     - 样例 ZIM Invoice："All payments must be issued to ..."（payee）、R.O.E. 汇率与本币金额、
       Place of payment、日期写法 10/03/2025 存在 MM/DD 与 DD/MM 歧义（只存原文）。
+    - 样例 CMA CGM General Notice：没有单据编号（只能靠 B/L 匹配）、费用代码 OCA17、
+      "REMIT TO"（payee）；正文条款里的 $25 / $150 / $1100 是费率说明，不是本单费用。
 
 需要标准化的字段（四.3、二.5）在这一层只保存原文（*_raw），
 由 normalize 模块转换，保证"同时保存原始与标准值"。
@@ -42,7 +44,8 @@ class ExtractedCharge(StrictModel):
     """单个费用项（四.4 每个费用项生成一条记录）。"""
 
     line_no: int = Field(ge=1, description="费用在单据费用表中的行序号，从 1 开始；同名费用靠它区分")
-    charge_name_raw: str = Field(min_length=1, description="单据上的原始费用名称")
+    charge_name_raw: str = Field(min_length=1, description="单据上的原始费用名称（被截断时也原样保留）")
+    charge_code_raw: str | None = Field(default=None, description="费用代码，如 CMA CGM 的 'OCA17'")
     basis_raw: str | None = Field(
         default=None, description="计费基准列原文（如 ZIM 的 Base 列 'C'、'PTT'，DN 的 UNIT 列 '-'），含义不解释，原样保存"
     )

@@ -107,3 +107,34 @@ def test_zim_basis_column_kept_raw(zim):
     # Base 列原样保存；币种（USD）在单独的 Curr 列
     assert [c.basis_raw for c in zim.charges] == ["C", "PTT"]
     assert {c.currency_raw for c in zim.charges} == {"USD"}
+
+
+# ---------- CMA CGM General Notice（PDF示例账单1） ----------
+
+@pytest.fixture
+def notice() -> ExtractedDocument:
+    return load("NOTICE_CMA_CMDUCHN4053601.expected_extraction.json")
+
+
+def test_notice_has_no_reference_no_but_has_bl(notice):
+    # 没有单据编号，匹配规则 1 不可用，只能走规则 2（提单号 + 费用名 + 币种）
+    assert notice.reference_no is None
+    assert notice.master_bl_no == "CMDUCHN4053601"
+
+
+def test_notice_only_billed_charge_extracted(notice):
+    # 3 页重复页眉不能导致重复抽取；条款里的 $25 / $150 / $1100 是费率说明，不是本单费用
+    assert len(notice.charges) == 1
+    c = notice.charges[0]
+    assert (c.charge_code_raw, c.amount, c.payment_term_raw) == ("OCA17", Decimal("245.0000"), "C")
+    assert not {Decimal("25"), Decimal("150"), Decimal("1100")} & {x.amount for x in notice.charges}
+
+
+def test_notice_payee_from_remit_to(notice):
+    # 单据类型不是 DN/Invoice，AR/AP 方向只能依靠 payee（REMIT TO）
+    assert notice.payee == notice.issuer == "CMA CGM (AMERICA) LLC"
+    assert notice.recipient == "NEPTUNE SHIPPING LIMITED"
+
+
+def test_notice_total_matches(notice):
+    assert sum(c.amount for c in notice.charges) == notice.totals[0].total_amount
