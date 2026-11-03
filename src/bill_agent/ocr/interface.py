@@ -1,6 +1,6 @@
-"""OCR 接入接口（只定义契约，不包含实现）。
+"""OCR 接入接口。
 
-视觉模型 OCR 服务实现 OCRBackend.recognize 即可：
+默认实现是 local.LocalOCR（PDF 文字层 + PaddleOCR）。其他 OCR（视觉模型等）实现 OCRBackend.recognize 即可：
 
     class VisionOCR:
         name = "qwen-vl-max"                       # 记入 RawDocument.ocr_engine
@@ -36,6 +36,9 @@ class OCRResult:
     confidence: float | None = None     # 0~1，没有就留空
     raw_response: dict | None = None    # 模型原始输出，用于审计
     warnings: list[str] = field(default_factory=list)
+    # 本文档实际使用的引擎（如 "pdf-text-layer"）；为空时用 backend.name。
+    # 组合后端按页选择引擎时用它记录真实来源
+    engine: str | None = None
 
 
 class OCRBackend(Protocol):
@@ -59,7 +62,7 @@ def run_ocr(docs: list[RawDocument], backend: OCRBackend) -> list[RawDocument]:
             ]
             out.append(doc.complete_ocr(
                 text=r.text,
-                engine=backend.name,
+                engine=r.engine or backend.name,
                 tables=[t for t in tables if t.rows or t.header],
                 confidence=r.confidence,
                 raw_response=r.raw_response,

@@ -9,6 +9,8 @@ __pycache__/
 *.db
 output/
 data/blobs/
+data/ocr_cache/
 # 样例原件含银行账户信息，不入库；只提交人工标注的 *.expected_extraction.json
 tests/fixtures/samples/*.pdf
 tests/fixtures/samples/*.png
+tests/fixtures/qa

@@ -9,7 +9,7 @@
 航运和货代业务的费用信息散落在邮件、PDF 账单、扫描件、Excel 和 Word 中。本项目要开发一个 Agent，能自动完成以下工作：
 
 1. 解析多种格式的输入（EML / PDF / 图片 / Excel / Word / 已有账单 JSON）；
-2. PDF 和图片登记为待 OCR，由视觉模型 OCR 服务补充文本和表格；
+2. PDF 和图片登记为待 OCR，由本地 OCR 补充文本和表格（PDF 文字层优先，扫描页和图片用 PaddleOCR）；
 3. 抽取单据和费用明细，并对费用名称、币种、付款方式做标准化；
 4. 与已有账单做匹配，判定新增、更新、无变化或待人工复核；
 5. 从记账主体的视角判断 AR/AP；
@@ -25,7 +25,7 @@
 | 验收标准 | 负责模块 | 章节 |
 |---|---|---|
 | 1. 解析 EML 正文及附件 | `parsers/eml.py` + Router 递归 | 6.1 |
-| 2. 调用 OCR 识别 PDF 和图片 | `parsers/pdf_image.py`（登记）+ `ocr/interface.py`（视觉模型接入） | 6.1、6.2 |
+| 2. 调用 OCR 识别 PDF 和图片 | `parsers/pdf_image.py`（登记）+ `ocr/`（文字层 + PaddleOCR） | 6.1、6.2 |
 | 3. 解析 Excel 和 Word 中的费用表格 | `parsers/excel.py`、`parsers/word.py` | 6.1 |
 | 4. 提取单据编号、费用、金额、币种 | `extract/` (LLM 结构化抽取) | 6.3 |
 | 5. 区分新增账单与更新账单 | `billing/matcher.py`、`billing/operation.py` | 6.6、6.7 |
@@ -43,10 +43,13 @@
 |---|---|---|
 | 语言 | Python 3.11+ | |
 | Agent 框架 | LangChain + LangGraph | 用 LangGraph 状态机编排主流程，LLM 调用走 LangChain |
+| LLM | DeepSeek（`langchain-deepseek`，默认 `deepseek-v4-pro`） | 关闭思考模式，用 function calling 做结构化输出 |
 | 结构化输出 | Pydantic v2 + `with_structured_output` | 强约束 LLM 输出 |
 | 邮件解析 | `email` 标准库（`policy.default`） | 处理头部解码和多级 MIME |
 | Excel | `openpyxl`、`pandas`、`xlrd`（.xls） | |
 | Word | `python-docx`；.doc 先用 LibreOffice 转换 | |
+| PDF 文字层 | `pdfplumber` | 系统生成的 PDF 直接读文字层，不走 OCR |
+| OCR | PaddleOCR 3.x（PP-StructureV3：版面 + PP-OCRv5 + 表格结构） | 本地运行；可选依赖 `.[ocr]` |
 | 本地数据库 | SQLite（`sqlite3` 或 SQLModel） | 轻量，支持索引和事务 |
 | 模糊匹配 | `rapidfuzz` | 用于公司名（记账主体别名）匹配 |
 | 测试 | `pytest` | |
@@ -62,7 +65,7 @@ flowchart LR
     R -->|.eml| EML[EML 解析]
     EML -->|附件| R
     R -->|.pdf/.jpg/.png/.tiff| PEND[登记 pending_ocr]
-    PEND --> OCR[视觉模型 OCR]
+    PEND --> OCR[本地 OCR：文字层 / PaddleOCR]
     R -->|.xls/.xlsx| XL[Excel 解析]
     R -->|.doc/.docx| WD[Word 解析]
     R -->|existing .json| DB[(账单库 SQLite)]
@@ -121,7 +124,10 @@ shipping-bill-agent/
 │   │   ├── json_bill.py
 │   │   └── pdf_image.py       # 登记为 pending_ocr
 │   ├── ocr/
-│   │   └── interface.py       # OCR 接入接口（视觉模型实现待补充）
+│   │   ├── interface.py       # OCRBackend 接口、run_ocr
+│   │   ├── pdf_text.py        # PDF 文字层读取 / 页面渲染
+│   │   ├── paddle.py          # PaddleOCR PP-StructureV3 封装
+│   │   └── local.py           # LocalOCR：按页组合文字层与 OCR
 │   ├── extract/
 │   │   ├── prompts.py
 │   │   └── extractor.py
@@ -212,11 +218,49 @@ python -m bill_agent parse <文件或目录>... [--blob-dir data/blobs] [--out p
 
 ### 6.2 OCR 服务
 
-**状态：只定义了接口，OCR 由视觉模型实现（待补充）。** 接口在 `src/bill_agent/ocr/interface.py`：
+**状态：已实现本地 OCR**（`src/bill_agent/ocr/`）。题目指定的 OCR API 不接入。
+
+```python
+from bill_agent.ocr import LocalOCR, run_ocr
+docs = run_ocr(parse_result.documents, LocalOCR(device="cpu"))   # device="gpu" 需安装 paddlepaddle-gpu
+```
+
+```bash
+pip install -e ".[ocr]"
+python -m bill_agent parse <文件或目录>... --ocr [--ocr-device cpu|gpu] [--out output/ocr.json]
+```
+
+**按页选择识别方式：**
+
+| 输入 | 处理 | `ocr_engine` | 置信度 |
+|---|---|---|---|
+| PDF 页有可用文字层 | `pdfplumber` 读取 layout 文本（保留列对齐） | `pdf-text-layer` | 1.0 |
+| PDF 页没有文字层（扫描件），或文字层字体缺少 Unicode 映射（`(cid:N)`、替换字符超过 5%） | 按 200 DPI 渲染成图片，交给 PaddleOCR | `paddleocr/PP-StructureV3` | 文本行分数平均值 |
+| 图片（多页 TIFF 每帧一页） | PaddleOCR | `paddleocr/PP-StructureV3` | 同上 |
+
+一份文档里两种方式都用到时，`ocr_engine` 记为 `pdf-text-layer+paddleocr/PP-StructureV3`，`raw_response.pages[]` 里逐页记录来源。文档置信度取各页的最小值。
+
+**设计取舍：**
+
+- **文字层优先**：题目测试集的 2 个 PDF 和邮件里的 MBL / HBL 都是系统生成的，带文字层。直接读取与原文完全一致，不会出现 0/O 之类的识别错误，耗时也只有毫秒级。
+- **文字层不提取表格**：在 DN DC-108478 上，`pdfplumber` 的表格提取把三行费用挤进一个单元格，还丢了 DESCRIPTION 列。错误的表格比没有表格更危险，所以费用表交给 LLM 从 layout 文本中读取。
+- **OCR 表格**：PP-StructureV3 输出 HTML 表格，转换为二维数组时展开 colspan / rowspan，合并单元格重复填值，表头交给 `build_table` 统一定位，与 Excel / Word 一致。
+- **不丢文本行**：PP-StructureV3 的版面分析会漏掉部分文本行（ZIM 样例的 `1X40 HC` / `JXLU4504463` 不在任何版面块里）。识别到但没有进入版面块的行，补在文本末尾的 `[未归入版面块的识别文本]` 下。
+- **结果缓存**：`CachedOCR` 按文件 SHA256 + 后端名缓存到 `data/ocr_cache/`，同一文件不重复识别（`--ocr-cache ''` 关闭）。
+- **低置信度留痕**：分数低于 0.8 的文本行写入 `warnings`；每一行的文字、分数和坐标保存在 `raw_response`，供校验环节核对具体字段。
+- **模型懒加载**：只有遇到扫描页或图片才加载 Paddle。首次运行时会下载模型到 `~/.paddlex`。
+- **已知问题**：Paddle 3.3 的 CPU 版开启 oneDNN 时，版面模型会报 `ConvertPirAttribute2RuntimeAttribute` 错误，因此固定 `enable_mkldnn=False`。CPU 上每张图片约 1 分钟，可以改用 GPU 加速。
+
+**样例上的识别结果：**
+
+- ZIM 发票 PNG：费用表完整识别（两行费用 + 合计 26.90），平均置信度 0.96。Base 列第二行原图左侧被裁切，只显示 `ᴾTT`，OCR 结果为 `TT`。
+- 邮件正文的 `InsertPic_C25B.jpg` 是邮件签名里的宣传横幅（"中美跨境·数智工具"），不含费用信息。
+
+**接口**（`ocr/interface.py`）：其他 OCR 实现（视觉模型、题目原 API）也可以按同一接口接入。
 
 ```python
 class OCRBackend(Protocol):
-    name: str                                                    # 记入 RawDocument.ocr_engine
+    name: str                                                    # 默认记入 RawDocument.ocr_engine
     def recognize(self, doc: RawDocument, data: bytes) -> OCRResult: ...
 
 @dataclass
@@ -224,17 +268,12 @@ class OCRResult:
     text: str
     tables: list[list[list[str | None]] | RawTable] = []         # 二维表格即可，表头由统一逻辑定位
     confidence: float | None = None                              # 0~1
-    raw_response: dict | None = None                             # 模型原始输出，用于审计
+    raw_response: dict | None = None                             # 原始输出，用于审计
     warnings: list[str] = []
-
-docs = run_ocr(parse_result.documents, backend)
+    engine: str | None = None                                    # 实际使用的引擎，覆盖 backend.name
 ```
 
-`run_ocr` 只处理 `pending_ocr` 和 `ocr_failed` 状态的文档，从 `file_ref` 读取原文件交给模型。识别成功调用 `complete_ocr()` 转为 `ocr_done`，抛出异常则调用 `fail_ocr()` 转为 `ocr_failed`。其他文档原样返回，顺序不变。
-
-实现视觉模型时可以利用：`doc.mime_type`（`application/pdf`、`image/png` 等，按真实内容识别）、`doc.file_name`，以及 `doc.parent_id` 对应的邮件上下文。
-
-题目原本指定的 OCR API（`https://gateway.pltplt.com/ai/process`，要求传入公网可访问的文件 URL）如果后续还要接入，也按同一个接口实现即可。
+`run_ocr` 只处理 `pending_ocr` 和 `ocr_failed` 状态的文档，从 `file_ref` 读取原文件。识别成功调用 `complete_ocr()` 转为 `ocr_done`，抛出异常则调用 `fail_ocr()` 转为 `ocr_failed`。其他文档原样返回，顺序不变。
 
 ### 6.3 信息抽取（LLM）
 
@@ -504,6 +543,22 @@ def decide_posting_type(doc_type, issuer, recipient, entity, amount, refund_hint
 
 ---
 
+### 6.10 文件问答（检验解析 / OCR 结果能否支撑 LLM）
+
+OCR 的最终用途是给 LLM 理解单据。在实现 M2 抽取之前，先用问答检验：只把解析 / OCR 后的文本交给模型，看它能否答对单据上的问题。实现在 `src/bill_agent/qa.py`，模型接入在 `src/bill_agent/llm.py`。
+
+```bash
+# 单次提问（-q 可重复）；不给 -q 进入交互模式
+python -m bill_agent ask "D:/Leetcode/demo/笔试题AIAGENT/图片示例.png" -q "列出所有费用项目和金额"
+# 按评测集逐题提问并判分
+python -m bill_agent qa-eval tests/fixtures/qa --samples-dir "D:/Leetcode/demo/笔试题AIAGENT" --out output/qa_report.json
+```
+
+- **上下文**：每份文档的来源、识别方式、置信度、全文文本，以及低置信度行提示。未完成 OCR 的文档不进入上下文。
+- **结构化输出**：`found`（文件中是否有答案）、`answer`、`evidence`（逐字摘录的原文）。
+- **证据核验**：代码把每条 evidence 放回上下文中查找（忽略空白和大小写），找不到即视为编造。这与 M2 抽取的证据校验是同一套思路。
+- **评测集**（`tests/fixtures/qa/*.qa.json`）：4 个样例共 35 题。`expect` 要求答案包含全部片段（比较时忽略大小写、空白和千分位逗号）；`expect_found: false` 是文件中没有答案的陷阱题，用来检验模型会不会编造。证据核验不通过的题也判为失败。
+
 ## 7. Agent 编排（LangGraph）
 
 ```python
@@ -538,7 +593,7 @@ stateDiagram-v2
 | 节点 | 实现 | 是否调用 LLM |
 |---|---|---|
 | parse | Router | 否 |
-| ocr | `run_ocr` + 视觉模型（只处理 pending_ocr / ocr_failed） | 视觉模型 |
+| ocr | `run_ocr` + `LocalOCR`（只处理 pending_ocr / ocr_failed） | 否（PaddleOCR） |
 | extract | 结构化抽取（把校验错误作为反馈带入下一次重试） | **是** |
 | normalize | 查表（只改写标准化表中的名称） | 否 |
 | validate | 规则校验 + 证据溯源 | 否 |
@@ -584,7 +639,10 @@ parse:
   blob_dir: "data/blobs"    # PDF / 图片原文件存档
   max_depth: 5
 ocr:
-  engine: "..."             # 视觉模型，待定
+  engine: "local"           # PDF 文字层 + PaddleOCR PP-StructureV3
+  device: "cpu"             # cpu / gpu
+  dpi: 200                  # 扫描页渲染分辨率
+  low_conf: 0.8             # 低于此分数的文本行写入 warnings
 llm:
   provider: "openai"        # 待定
   model: "..."
@@ -612,8 +670,9 @@ python -m bill_agent run \
 
 | 阶段 | 内容 | 产出 |
 |---|---|---|
-| M0 | 下载样例数据；OCR 接口约定（视觉模型实现待补充） | `ocr/interface.py` ✅ |
+| M0 | 下载样例数据；OCR 接口约定 | `ocr/interface.py` ✅ |
 | M1 | 数据模型；EML / Excel / Word 解析器；Router 递归；PDF / 图片登记为待 OCR | 解析器 + 单元测试 ✅ |
+| M1.5 | 本地 OCR：PDF 文字层 + PaddleOCR PP-StructureV3 | `ocr/local.py` + 单元测试 ✅ |
 | M2 | LLM 结构化抽取 + 证据；标准化模块 | 抽取结果达到可用水平 |
 | M3 | 校验模块；SQLite 账单库；JSON 导入 | |
 | M4 | 4 级匹配；操作判定；字段级 diff；AR/AP 规则 | 核心业务闭环 |
@@ -624,10 +683,10 @@ python -m bill_agent run \
 
 ## 11. 待确认问题
 
-1. **OCR**：改为由视觉模型按 `OCRBackend` 接口实现（待补充）。
+1. **OCR**：✅ 已实现本地 OCR（PDF 文字层 + PaddleOCR）。GPU 加速（paddlepaddle-gpu）待定。
 2. **记账主体**：✅ 已确认为 PAT（湃乐多 / Pilot Aiship Tech），由外部配置提供；`SHA` 不是 PAT。
 3. **样例数据**：已有账单 JSON 的字段结构需要对照样例确认，并据此调整 `bill_records` 的映射。
-4. **LLM 选型**：没有指定，需要支持结构化输出（function calling 或 JSON mode）。
+4. **LLM 选型**：✅ DeepSeek（本机已配置 `DEEPSEEK_API_KEY`），模型名可用 `--model` 或 `BILL_AGENT_MODEL` 切换。
 5. **扩展字段**：输出中加入扩展字段是否会影响评测，是否需要严格只输出样例中的字段。
 6. **没有已有账单 JSON**：题目测试集（2 个 PDF、1 张图片、1 封 EML）里没有已有账单 JSON。账单库从空库开始，UPDATE 只能由同一批次中先后到达的单据触发。
 7. **非账单文档**：测试集中的 MBL/HBL 提单本身没有费用，但带有提单号和箱号，可以作为上下文用于匹配。Pre-alert 邮件正文里有一笔 `SHA pay TAR：H/C $50`；✅ 已确认 SHA 不是 PAT，这笔费用照常抽取，posting_type 为 null。
