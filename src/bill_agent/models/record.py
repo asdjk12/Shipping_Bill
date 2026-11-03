@@ -16,7 +16,7 @@ from uuid import uuid4
 from pydantic import Field
 
 from .common import Amount, Evidence, StrictModel
-from .enums import DCDirection, DocumentType, PaymentTerm, PostingType
+from .enums import DocumentType, PaymentTerm, PostingType
 
 CURRENCY_PATTERN = r"^[A-Z]{3}$"  # 七.4 币种统一使用三位代码；ISO 4217 白名单在 validate 模块
 
@@ -35,8 +35,7 @@ class ChargeRecord(StrictModel):
     payer: str | None = None
 
     # --- 匹配键（四.5）
-    master_bl_no: str | None = None
-    house_bl_no: str | None = None
+    bl_nos: list[str] = Field(default_factory=list)
     booking_no: str | None = None
     container_nos: list[str] = Field(default_factory=list)
 
@@ -47,17 +46,11 @@ class ChargeRecord(StrictModel):
         description="费用名称：命中四.3 标准化表时为标准名，否则原样照抄原始名称（不做改写）",
     )
     original_charge_item: str = Field(min_length=1, description="原始费用名称")
-    charge_code: str | None = None
-    basis: str | None = None
     quantity: Amount | None = None
     unit_price: Amount | None = None
     amount: Amount | None = None
     currency: str | None = Field(default=None, pattern=CURRENCY_PATTERN)
-    dc_direction: DCDirection | None = None
     payment_term: PaymentTerm | None = None
-    exchange_rate: Amount | None = None
-    local_amount: Amount | None = None
-    local_currency: str | None = Field(default=None, pattern=CURRENCY_PATTERN)
 
     # --- 财务属性（四.6）
     accounting_entity: str | None = None
@@ -66,10 +59,6 @@ class ChargeRecord(StrictModel):
     # --- 溯源（二.9）
     source_ids: list[str] = Field(default_factory=list)
     evidence: dict[str, Evidence] = Field(default_factory=dict)
-
-    def bl_nos(self) -> list[str]:
-        """匹配规则 2 的提单号：Master 和 House 都参与匹配。"""
-        return [b for b in (self.master_bl_no, self.house_bl_no) if b]
 
     def business_fields(self) -> dict:
         """参与 UPDATE diff 的业务字段（不含溯源信息）。"""

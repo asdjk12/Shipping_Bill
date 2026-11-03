@@ -279,67 +279,55 @@ class OCRResult:
 
 用 `llm.with_structured_output(ExtractedDocument)` 做抽取，temperature 设为 0。
 
+**抽取结构只包含 test.pdf 要求的字段**（代码见 `src/bill_agent/models/extraction.py`）。单据上的其他信息，如船名、港口、结算条款、汇率、费用代码等，一律不抽取，后续业务需要时再加。`tests/unit/test_samples.py::test_schema_only_has_spec_fields` 锁定了字段集合：新增字段必须有题目依据，并同步修改这个测试。
+
 ```python
-class Evidence(BaseModel):
-    source_id: str
-    quote: str                  # 原文片段（必须能在原文中找到）
+class ExtractedCharge:                 # 每个费用项一条（四.4）
+    line_no: int                       # 行序号，同名费用靠它区分（四.4、四.7 重复提取）
+    charge_name_raw: str               # 费用名称（四.2）
+    quantity / unit_price / amount     # 数量、单价和金额（四.2）；贷记、退款为负数
+    currency_raw: str | None           # 币种（四.2）
+    payment_term_raw: str | None       # PP / CC 等付款方式（四.2）
+    evidence: dict[str, Evidence]
 
-class ExtractedCharge(BaseModel):
-    charge_name_raw: str
-    quantity: float | None
-    unit_price: float | None
-    amount: float | None
-    currency_raw: str | None
-    payment_term_raw: str | None   # PP/CC/Prepaid/Collect...
-    container_no: str | None
-    evidence: list[Evidence]
+class DocumentTotal:                   # 小计、税额和总计（四.2），按币种分组
+    currency_raw, subtotal, tax_amount, total_amount
 
-class ExtractedDocument(BaseModel):
-    document_type: Literal["Debit Note","Credit Note","Invoice","Statement","Other"] | None
-    reference_no: str | None
-    document_date: str | None      # YYYY-MM-DD
-    issuer: str | None
-    recipient: str | None
-    bl_no: str | None              # 提单号
-    booking_no: str | None         # 订舱号
-    container_nos: list[str]       # 箱号
-    subtotal: float | None
-    tax: float | None
-    total: float | None
-    total_currency_raw: str | None
+class ExtractedDocument:
+    source_id: str                     # 文件来源（二.9）
+    document_type_raw, reference_no, document_date_raw   # 单据类型、编号及日期（四.2）
+    issuer, recipient                  # 签发方和接收方（四.2）
+    payee, payer                       # 单据写明的收款方 / 付款方：收费方向（四.6）
+    bl_nos: list[str]                  # 提单号（四.5 规则 2）
+    booking_no: str | None             # 订舱号（四.5 规则 3）
+    container_nos: list[str]           # 箱号（四.5 规则 4）
+    currency_raw: str | None           # 单据级币种；费用行没有币种时使用（四.2）
     charges: list[ExtractedCharge]
-    change_instructions: list[str] # 正文中的明确改账指令
-    evidence: dict[str, Evidence]  # 字段名 → 证据
+    totals: list[DocumentTotal]
+    change_instructions: list[ChangeInstruction]   # 明确的改账要求（四.5 只改明确要求变更的字段）
+    evidence: dict[str, Evidence]      # 字段名 → 原文证据（二.9、七.1 不得虚构）
 ```
 
-相比你原方案的识别清单，这里补充了三类字段：
+- 需要标准化的字段（单据类型、日期、币种、付款方式、费用名）在这一层只保存原文（`*_raw`），由 normalize 模块转换。
+- 金额内部用 `Decimal`；像 `4O.00` 这种字母混进数字的值直接报错，交给校验环节（四.7）。
+- `evidence` 只能指向已定义的字段，模型编造的字段名会被拒绝。
 
-- **提单号、订舱号、箱号**：匹配规则 2、3、4 都要用到；
-- **evidence**：作为原文证据，用来防止编造数据；
-- **change_instructions**：记录正文里明确要求修改的内容，用来支持“只修改明确要求变更的字段”。
+**样例上的处理说明**（人工标注的理想抽取结果在 `tests/fixtures/samples/*.expected_extraction.json`）：
 
-**根据网盘样例修正（2026-10-28）**：代码以 `src/bill_agent/models/` 为准，样例的人工标注在 `tests/fixtures/samples/`。
-
-| 样例现象 | 模型调整 |
+| 样例现象 | 处理 |
 |---|---|
-| DN DC-108478 中有两行 `HANDLING CHARGE`（65.00 / 35.00） | 增加 `line_no`。匹配规则 1（单据号+费用名）不唯一，需要再用行号或金额区分 |
-| DN 有 DEBIT(+) / CREDIT(-) 两列 | 每个费用行增加 `dc_direction`，资金方向按行确定 |
-| DN 收件方为空，但写明 “BALANCE DUE TO NEPTUNE…”；ZIM 写明 “payments must be issued to…” | 增加 `payee` / `payer`，作为 AR/AP 的主要方向证据 |
-| DN 同时有 Master B/L 和 House B/L，还有 2 个箱号 | 增加 `master_bl_no` / `house_bl_no`；箱号改为 `container_nos` 列表 |
-| DN 费用行没有币种，只有表头 CURRENCY USD | 增加单据级 `currency_raw`，费用行缺币种时继承 |
-| DN 的 “TERMS COD”、ZIM 的 “PAY IMMEDIATELY” | 增加 `credit_terms_raw`，与 PP/CC 区分开 |
-| ZIM 有 R.O.E. 和本币金额 | 增加 `exchange_rate` / `local_amount` / `local_currency_raw` |
-| ZIM 的 Base 列（`C`、`PTT`）、DN 的 UNIT 列（`-`） | 存入 `basis_raw`，原样保存，不解释含义；币种取自单独的 Curr 列 |
-| ZIM 没有 PP/CC，只有 Place of payment: USORF | 增加 `place_of_payment`，付款方式保持 null，不做推测 |
-| ZIM 发票日期 10/03/2025，签章日期写作 03/10/2025 | 日期只存原文，标准化时按来源判断 MM/DD 或 DD/MM |
-| 样例中有银行账号、路由号 | schema 中不设对应字段，禁止抽取 |
+| DN DC-108478 中有两行 `HANDLING CHARGE`（65.00 / 35.00） | 用 `line_no` 区分。匹配规则 1（单据号 + 费用名）不唯一，需要再用行号或金额区分 |
+| DN 收件方为空，但写明 “BALANCE DUE TO NEPTUNE…”；ZIM 写明 “payments must be issued to…”；CMA 写明 “REMIT TO CMA CGM” | 填入 `payee`，作为 AR/AP 的主要方向证据（见 6.8） |
+| DN 同时有 Master B/L 和 House B/L | 两个都放进 `bl_nos`，匹配时都参与 |
+| DN 费用行没有币种，只有表头 CURRENCY USD | 填单据级 `currency_raw`，费用行缺币种时继承 |
+| ZIM 发票日期 10/03/2025 | 日期只存原文，标准化时再判断 MM/DD 或 DD/MM |
+| ZIM 没有 PP/CC | `payment_term_raw` 保持 null，不做推测 |
+| 样例中有银行账号、路由号 | schema 中没有对应字段，不抽取 |
 | CMA CGM General Notice（PDF示例账单1）**没有单据编号** | `reference_no` 为 null；匹配规则 1 不可用，靠提单号走规则 2 |
-| 该通知的费用行带代码 `OCA17`，费用名在原件中被截断（`On Carriage Additional - US Em`） | 增加 `charge_code_raw`；费用名按原样保留，不补全 |
-| 该通知是 “GENERAL NOTICE”，不属于 DN/CN/Invoice，但写明 “REMIT TO CMA CGM” | 单据类型标准化为 Other；AR/AP 改为**优先看 payee**（见 6.8） |
-| B/L 在同一页写作 `CMDUCHN4053601` 和 `CMDU CHN4053601`（SCAC 与单号之间有空格） | 匹配前去掉提单号中的空格 |
-| Pre-alert 邮件**正文里有一笔费用**：`SHA pay TAR：H/C $50`（SHA 付给 TAR 操作费 50 美元），同时写明 `Carrier Free H/C` | 邮件正文也要抽取费用。`H/C` 不在题目给的标准化表中，按规则原样保留；`SHA` / `TAR` 是付款方和收款方的代码，原样抽取，是否对应记账主体由别名表判断 |
-| 同一封邮件写明 `FREIGHT PREPAID`、MBL/HBL `Telex release HOLD` | `FREIGHT PREPAID` 是运费的付款方式，不代表 H/C 这笔费用也是 PP，不能套用到其他费用上 |
-| 正文中粘贴的截图（Foxmail `InsertPic_*.jpg`，通过 cid 嵌在 HTML 正文里） | 按图片登记为 pending_ocr；OCR 后与邮件正文属于同一封邮件（`parent_id`），抽取时可以合并上下文 |
+| B/L 在同一页写作 `CMDUCHN4053601` 和 `CMDU CHN4053601` | 匹配前去掉提单号中的空格 |
+| Pre-alert 邮件**正文里有一笔费用**：`SHA pay TAR：H/C $50`，同时写明 `Carrier Free H/C` | 邮件正文也要抽取费用。`H/C` 不在题目给的标准化表中，原样保留；`SHA` / `TAR` 原样抽取为付款方和收款方 |
+| 同一封邮件写明 `FREIGHT PREPAID` | 只适用于运费，不能套用到 H/C 这笔费用上 |
+| 邮件正文嵌入的 `InsertPic_C25B.jpg` | OCR 后确认是邮件签名里的宣传横幅，不含费用 |
 
 Prompt 要点：
 - 只从**本单实际收费的费用行**抽取。条款或说明里的金额（如“取消 I.T. 收 $25”“司机等待 $150/小时”“误还箱 $1100”）是费率说明，不是费用；

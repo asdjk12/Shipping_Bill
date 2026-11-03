@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from bill_agent.models import DCDirection, ExtractedDocument
+from bill_agent.models import DocumentTotal, ExtractedCharge, ExtractedDocument
 
 SAMPLES = Path(__file__).parents[1] / "fixtures" / "samples"
 
@@ -46,9 +46,7 @@ def test_dn_same_name_charges_distinguished_by_line_no(dn):
 
 
 def test_dn_lines_sum_to_total(dn):
-    total = dn.totals[0]
-    assert sum(c.amount for c in dn.charges) == total.total_amount == total.balance_due
-    assert total.total_credit == 0
+    assert sum(c.amount for c in dn.charges) == dn.totals[0].total_amount
 
 
 def test_dn_recipient_empty_but_payee_explicit(dn):
@@ -57,7 +55,7 @@ def test_dn_recipient_empty_but_payee_explicit(dn):
 
 
 def test_dn_two_bls_two_containers(dn):
-    assert (dn.master_bl_no, dn.house_bl_no) == ("MAEU275752922", "CGT260801188")
+    assert dn.bl_nos == ["MAEU275752922", "CGT260801188"]
     assert dn.container_nos == ["MRSU2571577", "TCLU8619685"]
 
 
@@ -66,18 +64,12 @@ def test_dn_currency_only_at_document_level(dn):
     assert all(c.currency_raw is None for c in dn.charges)
 
 
-def test_dn_cod_is_credit_term_not_payment_term(dn):
-    assert dn.credit_terms_raw == "COD"
+def test_dn_payment_term_kept_raw(dn):
+    # P/C 列的 "C" 原样保存，由 normalize 模块转成 CC
     assert {c.payment_term_raw for c in dn.charges} == {"C"}
-    assert all(c.dc_direction is DCDirection.DEBIT for c in dn.charges)
 
 
 # ---------- ZIM Invoice ORFR1618731 ----------
-
-def test_zim_local_amount_equals_amount_times_roe(zim):
-    for c in zim.charges:
-        assert c.amount * c.exchange_rate == c.local_amount
-
 
 def test_zim_lines_sum_to_total(zim):
     assert sum(c.amount for c in zim.charges) == zim.totals[0].total_amount
@@ -86,7 +78,6 @@ def test_zim_lines_sum_to_total(zim):
 def test_zim_no_payment_term_on_document(zim):
     # 单据上没有 PP/CC，不能推测
     assert all(c.payment_term_raw is None for c in zim.charges)
-    assert zim.place_of_payment == "USORF"
 
 
 def test_zim_date_kept_raw(zim):
@@ -103,10 +94,25 @@ def test_duplicate_line_no_rejected(dn):
         ExtractedDocument.model_validate(data)
 
 
-def test_zim_basis_column_kept_raw(zim):
-    # Base 列原样保存；币种（USD）在单独的 Curr 列
-    assert [c.basis_raw for c in zim.charges] == ["C", "PTT"]
+def test_zim_currency_on_each_line(zim):
     assert {c.currency_raw for c in zim.charges} == {"USD"}
+    assert zim.currency_raw is None
+
+
+def test_schema_only_has_spec_fields():
+    # 抽取结构只包含 test.pdf 要求的字段（四.2 + 四.4/四.5/四.6/四.7 + 二.9）；
+    # 新增字段需要有题目依据，并同步修改这里
+    assert set(ExtractedDocument.model_fields) == {
+        "source_id", "document_type_raw", "reference_no", "document_date_raw",
+        "issuer", "recipient", "payee", "payer",
+        "bl_nos", "booking_no", "container_nos",
+        "currency_raw", "charges", "totals", "change_instructions", "evidence",
+    }
+    assert set(ExtractedCharge.model_fields) == {
+        "line_no", "charge_name_raw", "quantity", "unit_price", "amount",
+        "currency_raw", "payment_term_raw", "evidence",
+    }
+    assert set(DocumentTotal.model_fields) == {"currency_raw", "subtotal", "tax_amount", "total_amount"}
 
 
 # ---------- CMA CGM General Notice（PDF示例账单1） ----------
@@ -119,14 +125,14 @@ def notice() -> ExtractedDocument:
 def test_notice_has_no_reference_no_but_has_bl(notice):
     # 没有单据编号，匹配规则 1 不可用，只能走规则 2（提单号 + 费用名 + 币种）
     assert notice.reference_no is None
-    assert notice.master_bl_no == "CMDUCHN4053601"
+    assert notice.bl_nos == ["CMDUCHN4053601"]
 
 
 def test_notice_only_billed_charge_extracted(notice):
     # 3 页重复页眉不能导致重复抽取；条款里的 $25 / $150 / $1100 是费率说明，不是本单费用
     assert len(notice.charges) == 1
     c = notice.charges[0]
-    assert (c.charge_code_raw, c.amount, c.payment_term_raw) == ("OCA17", Decimal("245.0000"), "C")
+    assert (c.amount, c.payment_term_raw) == (Decimal("245.0000"), "C")
     assert not {Decimal("25"), Decimal("150"), Decimal("1100")} & {x.amount for x in notice.charges}
 
 

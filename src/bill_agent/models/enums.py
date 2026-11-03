@@ -55,13 +55,6 @@ class Operation(str, Enum):
     PENDING_REVIEW = "PENDING_REVIEW"
 
 
-class DCDirection(str, Enum):
-    """费用行的借贷方向。样例 DN 有 DEBIT(+) / CREDIT(-) 两列，方向按行而非按单据。"""
-
-    DEBIT = "DEBIT"          # 签发方向接收方收费
-    CREDIT = "CREDIT"        # 签发方向接收方退/付费
-
-
 class PostingType(str, Enum):
     AR = "AR"                # 应收账款
     AP = "AP"                # 应付账款
