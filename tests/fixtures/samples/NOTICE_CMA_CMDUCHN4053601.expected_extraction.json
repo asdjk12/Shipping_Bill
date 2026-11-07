@@ -7,6 +7,9 @@
   "recipient": "NEPTUNE SHIPPING LIMITED",
   "payee": "CMA CGM (AMERICA) LLC",
   "payer": null,
+  "shipper": "CIMC WETRANS INTL LOG CO LTD",
+  "consignee": "NEPTUNE SHIPPING LIMITED",
+  "carrier": "CMA CGM (AMERICA) LLC",
   "bl_nos": [
     "CMDUCHN4053601"
   ],
@@ -18,7 +21,7 @@
   "charges": [
     {
       "line_no": 1,
-      "charge_name_raw": "On Carriage Additional - US Em",
+      "charge_name_raw": "OCA17 On Carriage Additional - US Em",
       "quantity": null,
       "unit_price": null,
       "amount": 245.0,

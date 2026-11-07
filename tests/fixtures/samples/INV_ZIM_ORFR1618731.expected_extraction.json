@@ -3,10 +3,13 @@
   "document_type_raw": "DEBIT INVOICE",
   "reference_no": "ORFR1618731",
   "document_date_raw": "10/03/2025",
-  "issuer": "ZIM AMERICAN INTEGRATED SHIPPING SERVICES CO. LLC AS AGENTS FOR ZIM INTEGRATED SHIPPING SERVICES LTD",
+  "issuer": "ZIM AMERICAN INTEGRATED SHIPPING SERVICES CO. LLC",
   "recipient": "ALL AMERICA FORWARDING, INC.",
-  "payee": "Zim American Integrated Shipping Services Co., LLC As Agents for Zim Integrated Shipping Services Ltd.",
+  "payee": "Zim American Integrated Shipping Services Co., LLC",
   "payer": "USIAHALLAM",
+  "shipper": null,
+  "consignee": null,
+  "carrier": "ZIM AMERICAN INTEGRATED SHIPPING SERVICES CO. LLC",
   "bl_nos": [
     "ZIMUNGB1312144"
   ],
@@ -14,7 +17,7 @@
   "container_nos": [
     "JXLU4504463"
   ],
-  "currency_raw": null,
+  "currency_raw": "USD",
   "charges": [
     {
       "line_no": 1,

@@ -51,7 +51,7 @@ def test_dn_lines_sum_to_total(dn):
 
 def test_dn_recipient_empty_but_payee_explicit(dn):
     assert dn.recipient is None
-    assert dn.payee == "NEPTUNE SHIPPING LIMITED (LAX)"
+    assert dn.payee == "NEPTUNE SHIPPING LIMITED"
 
 
 def test_dn_two_bls_two_containers(dn):
@@ -96,15 +96,15 @@ def test_duplicate_line_no_rejected(dn):
 
 def test_zim_currency_on_each_line(zim):
     assert {c.currency_raw for c in zim.charges} == {"USD"}
-    assert zim.currency_raw is None
+    assert zim.currency_raw == "USD"        # 合计行写明了 USD
 
 
 def test_schema_only_has_spec_fields():
-    # 抽取结构只包含 test.pdf 要求的字段（四.2 + 四.4/四.5/四.6/四.7 + 二.9）；
-    # 新增字段需要有题目依据，并同步修改这里
+    # 抽取结构只包含 test.pdf 要求的字段（四.2 + 四.4/四.5/四.6/四.7 + 二.9）和用户确认的
+    # 货物三方（shipper / consignee / carrier）；新增字段需要有依据，并同步修改这里
     assert set(ExtractedDocument.model_fields) == {
         "source_id", "document_type_raw", "reference_no", "document_date_raw",
-        "issuer", "recipient", "payee", "payer",
+        "issuer", "recipient", "payee", "payer", "shipper", "consignee", "carrier",
         "bl_nos", "booking_no", "container_nos",
         "currency_raw", "charges", "totals", "change_instructions", "evidence",
     }
@@ -132,6 +132,7 @@ def test_notice_only_billed_charge_extracted(notice):
     # 3 页重复页眉不能导致重复抽取；条款里的 $25 / $150 / $1100 是费率说明，不是本单费用
     assert len(notice.charges) == 1
     c = notice.charges[0]
+    assert c.charge_name_raw == "OCA17 On Carriage Additional - US Em"     # 费用名称栏照抄，带费用代码
     assert (c.amount, c.payment_term_raw) == (Decimal("245.0000"), "C")
     assert not {Decimal("25"), Decimal("150"), Decimal("1100")} & {x.amount for x in notice.charges}
 

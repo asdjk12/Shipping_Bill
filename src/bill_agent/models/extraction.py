@@ -22,6 +22,8 @@
     - 费用行序号                       -> ExtractedCharge.line_no
 二.9 记录文件来源和处理依据；七.1 不得虚构数据
     - source_id、evidence
+业务需要（用户确认，不来自 test.pdf）：每份单据确认货物的三方
+    - 寄件人 / 收件人 / 送货人         -> shipper / consignee / carrier
 
 需要标准化的字段（四.3、二.5）在这一层只保存原文（*_raw），由 normalize 模块转换，
 保证"同时保存原始与标准值"。
@@ -83,6 +85,11 @@ class ExtractedDocument(StrictModel):
     payee: str | None = Field(default=None, description="单据写明的收款方，如 'BALANCE DUE TO X'、'REMIT TO X'")
     payer: str | None = Field(default=None, description="单据写明的付款方，如 'Payer: X'")
 
+    # --- 货物三方：寄件人委托航运公司把货送给收件人。与上面的账单双方是两回事，经手方、中转不记录
+    shipper: str | None = Field(default=None, description="寄件人，按语义判断，不依赖 SHIPPER 这类固定标签")
+    consignee: str | None = Field(default=None, description="收件人，按语义判断，不依赖 CONSIGNEE 这类固定标签")
+    carrier: str | None = Field(default=None, description="送货人：收取本单费用的航运公司")
+
     # --- 匹配键
     bl_nos: list[str] = Field(default_factory=list, description="单据上所有提单号")
     booking_no: str | None = None
@@ -102,13 +109,17 @@ class ExtractedDocument(StrictModel):
     @model_validator(mode="after")
     def _check_consistency(self) -> "ExtractedDocument":
         # 1. 证据只能指向真实存在的字段，防止 LLM 编造字段名
-        doc_fields = set(type(self).model_fields) - {"evidence", "charges", "totals", "change_instructions"}
-        bad = set(self.evidence) - doc_fields
+        doc_fields = set(type(self).model_fields) - {"evidence", "charges", "change_instructions"}
+        problems = []
+        if bad := set(self.evidence) - doc_fields:
+            problems.append(f"单据 evidence 中存在未知字段 {sorted(bad)}，可用字段: {sorted(doc_fields)}")
         charge_fields = set(ExtractedCharge.model_fields) - {"evidence"}
         for c in self.charges:
-            bad |= set(c.evidence) - charge_fields
-        if bad:
-            raise ValueError(f"evidence 中存在未知字段: {sorted(bad)}")
+            if bad := set(c.evidence) - charge_fields:
+                problems.append(f"费用行 {c.line_no} 的 evidence 中存在未知字段 {sorted(bad)}，"
+                                f"可用字段: {sorted(charge_fields)}")
+        if problems:
+            raise ValueError("；".join(problems))
         # 2. 行号唯一
         line_nos = [c.line_no for c in self.charges]
         if len(line_nos) != len(set(line_nos)):

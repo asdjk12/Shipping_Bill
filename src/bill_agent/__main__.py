@@ -4,11 +4,18 @@
                                [--ocr [--ocr-device cpu|gpu]]
     python -m bill_agent ask <文件或目录>... [-q 问题]... [--model deepseek-v4-pro]
     python -m bill_agent qa-eval <评测集文件或目录>... --samples-dir <样例目录> [--out report.json]
+    python -m bill_agent extract <文件或目录>... [--out extracted.json] [--max-retries 2]
+                                 [--max-review-retries 1] [--no-review]
+    python -m bill_agent extract-eval --samples-dir <样例目录> [--out report.json]
+    python -m bill_agent review-eval --samples-dir <样例目录> [--out report.json]
 
 parse：把输入文件集解析成 RawDocument，打印摘要并（可选）输出完整 JSON，用于检查解析层效果。
        PDF / 图片登记为 pending_ocr，原文件存档到 --blob-dir；加 --ocr 时接着用本地 OCR 识别。
 ask：解析 + OCR 后基于文件内容向 LLM 提问；不给 -q 时进入交互模式。
 qa-eval：按评测集逐题提问并判分，检验解析 / OCR 结果能否支撑 LLM 正确回答。
+extract：LLM 结构化抽取（ExtractedDocument）+ 代码核验 + LLM 审核；超过重试上限标为待人工复核。
+extract-eval：抽取 golden 标注对应的样例，逐字段对比（只评测抽取，不经过审核）。
+review-eval：评测审核模型：golden 不应被误报，故意改坏的字段应被发现。
 OCR 结果按文件哈希缓存在 --ocr-cache（默认 data/ocr_cache），同一文件不重复识别。
 """
 
@@ -141,6 +148,189 @@ def cmd_qa_eval(args: argparse.Namespace) -> int:
     return 0 if passed == total else 1
 
 
+def _print_extraction(r) -> None:
+    print(f"\n=== {' + '.join(r.source_paths)}  （第 {r.attempts} 次通过）" if not r.errors
+          else f"\n=== {' + '.join(r.source_paths)}  （{r.attempts} 次后仍有 {len(r.errors)} 个问题）")
+    for i, errs in enumerate(r.attempt_errors[:-1], start=1):
+        print(f"  第 {i} 次校验问题（已反馈给模型重试）：")
+        for e in errs:
+            print(f"    - {e}")
+    if not r.documents:
+        print("  没有收费单据")
+    for d in r.documents:
+        print(f"  [{d.document_type_raw}] {d.reference_no or '-'}  日期 {d.document_date_raw or '-'}")
+        print(f"    签发 {d.issuer or '-'} -> 接收 {d.recipient or '-'} | 收款 {d.payee or '-'} | 付款 {d.payer or '-'}")
+        print(f"    提单 {d.bl_nos or '-'} | 订舱 {d.booking_no or '-'} | 箱号 {d.container_nos or '-'} | 币种 {d.currency_raw or '-'}")
+        for c in d.charges:
+            print(f"    {c.line_no}. {c.charge_name_raw} | 数量 {c.quantity} | 单价 {c.unit_price} | 金额 {c.amount} "
+                  f"{c.currency_raw or ''} | 付款方式 {c.payment_term_raw}")
+        for t in d.totals:
+            print(f"    合计[{t.currency_raw}] 小计 {t.subtotal} | 税额 {t.tax_amount} | 总计 {t.total_amount}")
+        for ci in d.change_instructions:
+            print(f"    改账: {ci.target_charge_name_raw}.{ci.field} -> {ci.new_value_raw}")
+    for c in r.cleared:
+        print(f"  已置空（重试后仍没有证据）: {c}")
+    for e in r.errors:
+        print(f"  ! {e}")
+
+
+def _extraction_json(r) -> dict:
+    return {"source_paths": r.source_paths, "attempts": r.attempts, "errors": r.errors,
+            "attempt_errors": r.attempt_errors, "cleared": r.cleared,
+            "documents": [d.model_dump(mode="json") for d in r.documents], "raw_outputs": r.raw_outputs}
+
+
+def _print_review(review) -> None:
+    if review.incomplete:
+        print(f"  审核未完成：{review.incomplete}")
+    elif not review.issues:
+        print("  审核通过")
+    for i in review.issues:
+        print(f"  审核问题 - {i}")
+    for i in review.dismissed:
+        print(f"  已忽略（依据在原文中找不到）- {i}")
+
+
+def _print_gate(g) -> None:
+    for n, round_ in enumerate(g.rounds, start=1):
+        print(f"\n----- 第 {n} 轮 -----", end="")
+        _print_extraction(round_.extraction)
+        if round_.review:
+            _print_review(round_.review)
+    print(f"\n结论：{'通过，可进入下一步' if g.status.value == 'passed' else '待人工复核'}")
+    for reason in g.reasons:
+        print(f"  - {reason}")
+
+
+def _review_json(review) -> dict:
+    return {"issues": [vars(i) for i in review.issues], "dismissed": [vars(i) for i in review.dismissed],
+            "incomplete": review.incomplete, "attempts": review.attempts, "raw_outputs": review.raw_outputs}
+
+
+def _gate_json(g) -> dict:
+    return {"source_paths": g.source_paths, "status": g.status.value, "reasons": g.reasons,
+            "documents": [d.model_dump(mode="json") for d in g.documents],
+            "rounds": [{"extraction": _extraction_json(r.extraction),
+                        "review": r.review and _review_json(r.review)} for r in g.rounds]}
+
+
+def _write_json(path: str, data) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def cmd_extract(args: argparse.Namespace) -> int:
+    from bill_agent.extract import Extractor, ReviewGate, Reviewer
+    from bill_agent.llm import get_chat_model
+
+    docs = _parse_and_ocr(args.paths, args).documents
+    llm = get_chat_model(args.model)
+    extractor = Extractor(llm, max_retries=args.max_retries)
+    if args.no_review:
+        results = extractor.extract(docs)
+        for r in results:
+            _print_extraction(r)
+        data = [_extraction_json(r) for r in results]
+    else:
+        results = ReviewGate(extractor, Reviewer(llm), args.max_review_retries).extract(docs)
+        for g in results:
+            _print_gate(g)
+        data = [_gate_json(g) for g in results]
+    if args.out:
+        _write_json(args.out, data)
+        print(f"\n完整结果已写入 {args.out}")
+    return 0
+
+
+def cmd_extract_eval(args: argparse.Namespace) -> int:
+    from bill_agent.extract import Extractor
+    from bill_agent.extract.compare import compare
+    from bill_agent.llm import get_chat_model
+    from bill_agent.models import ExtractedDocument
+
+    golden_dir = Path(args.golden_dir)
+    manifest = json.loads((golden_dir / "manifest.json").read_text(encoding="utf-8"))
+    extractor = Extractor(get_chat_model(args.model), max_retries=args.max_retries)
+    report, total_n, total_diff = [], 0, 0
+    for golden_name, file_name in manifest.items():
+        if golden_name.startswith("_"):
+            continue
+        src = Path(args.samples_dir) / file_name
+        if not src.exists():
+            print(f"\n! 找不到样例文件 {src}，跳过")
+            continue
+        expected = ExtractedDocument.model_validate_json((golden_dir / golden_name).read_text(encoding="utf-8"))
+        results = extractor.extract(_parse_and_ocr([src], args).documents)
+        for r in results:
+            _print_extraction(r)
+        actual = [d for r in results for d in r.documents]
+        if not actual:
+            print(f"  [FAIL] {golden_name}: 没有抽取到单据")
+            report.append({"golden": golden_name, "fields": 0, "diffs": ["没有抽取到单据"]})
+            continue
+        n, diffs = compare(expected, actual[0])
+        total_n += n
+        total_diff += len(diffs)
+        print(f"  对比 {golden_name}: {n - len(diffs)} / {n} 个字段一致")
+        for d in diffs:
+            print(f"    ✗ {d.field}: 期望 {d.expected!r}，实际 {d.actual!r}")
+        report.append({"golden": golden_name, "fields": n,
+                       "diffs": [{"field": d.field, "expected": str(d.expected), "actual": str(d.actual)} for d in diffs],
+                       "extraction": [_extraction_json(r) for r in results]})
+
+    print(f"\n总计 {total_n - total_diff} / {total_n} 个字段一致")
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"明细已写入 {args.out}")
+    return 0 if total_diff == 0 else 1
+
+
+def cmd_review_eval(args: argparse.Namespace) -> int:
+    from bill_agent.extract import Reviewer, group_documents
+    from bill_agent.extract.review_eval import detected, mutations
+    from bill_agent.llm import get_chat_model
+    from bill_agent.models import ExtractedDocument
+
+    golden_dir = Path(args.golden_dir)
+    manifest = json.loads((golden_dir / "manifest.json").read_text(encoding="utf-8"))
+    reviewer = Reviewer(get_chat_model(args.model))
+    report, false_alarms, found, total = [], 0, 0, 0
+    for golden_name, file_name in manifest.items():
+        if golden_name.startswith("_"):
+            continue
+        src = Path(args.samples_dir) / file_name
+        if not src.exists():
+            print(f"\n! 找不到样例文件 {src}，跳过")
+            continue
+        golden = ExtractedDocument.model_validate_json((golden_dir / golden_name).read_text(encoding="utf-8"))
+        [group] = group_documents(_parse_and_ocr([src], args).documents)
+
+        print(f"\n=== {golden_name}")
+        clean = reviewer.review(group, [golden])
+        false_alarms += len(clean.issues)
+        print(f"  golden 误报 {len(clean.issues)} 处")
+        _print_review(clean)
+        entry = {"golden": golden_name, "clean": _review_json(clean), "mutations": []}
+
+        for m in mutations(golden):
+            r = reviewer.review(group, [m.document])
+            hit = detected(r, m)
+            found += hit
+            total += 1
+            print(f"  [{'发现' if hit else '漏过'}] {m.name}")
+            if not hit:
+                _print_review(r)
+            entry["mutations"].append({"name": m.name, "detected": hit, "review": _review_json(r)})
+        report.append(entry)
+
+    print(f"\ngolden 误报 {false_alarms} 处；改坏的字段发现 {found} / {total}")
+    if args.out:
+        _write_json(args.out, report)
+        print(f"明细已写入 {args.out}")
+    return 0 if false_alarms == 0 and found == total else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bill_agent")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -168,6 +358,30 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", help="模型名")
     p.add_argument("--out", help="输出评测明细 JSON 的路径")
     p.set_defaults(func=cmd_qa_eval)
+
+    p = sub.add_parser("extract", parents=[common], help="用 LLM 从文件中抽取结构化单据信息")
+    p.add_argument("paths", nargs="+")
+    p.add_argument("--model", help="模型名")
+    p.add_argument("--max-retries", type=int, default=2, help="代码核验失败后的最大重抽次数")
+    p.add_argument("--max-review-retries", type=int, default=1, help="审核退回后的最大重抽次数")
+    p.add_argument("--no-review", action="store_true", help="跳过 LLM 审核，只做抽取和代码核验")
+    p.add_argument("--out", help="输出抽取结果 JSON 的路径")
+    p.set_defaults(func=cmd_extract)
+
+    p = sub.add_parser("extract-eval", parents=[common], help="抽取样例并与 golden 标注逐字段对比")
+    p.add_argument("--samples-dir", required=True, help="题目测试集原件所在目录")
+    p.add_argument("--golden-dir", default="tests/fixtures/samples", help="golden 标注与 manifest.json 所在目录")
+    p.add_argument("--model", help="模型名")
+    p.add_argument("--max-retries", type=int, default=2)
+    p.add_argument("--out", help="输出对比明细 JSON 的路径")
+    p.set_defaults(func=cmd_extract_eval)
+
+    p = sub.add_parser("review-eval", parents=[common], help="评测审核模型的误报和发现能力")
+    p.add_argument("--samples-dir", required=True, help="题目测试集原件所在目录")
+    p.add_argument("--golden-dir", default="tests/fixtures/samples", help="golden 标注与 manifest.json 所在目录")
+    p.add_argument("--model", help="模型名")
+    p.add_argument("--out", help="输出评测明细 JSON 的路径")
+    p.set_defaults(func=cmd_review_eval)
 
     args = ap.parse_args(argv)
     return args.func(args)

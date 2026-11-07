@@ -3,10 +3,13 @@
   "document_type_raw": "DEBIT NOTE",
   "reference_no": "DC-108478",
   "document_date_raw": "10-24-2026",
-  "issuer": "Pilot Aiship Tech co., Ltd.",
+  "issuer": "NEPTUNE SHIPPING LIMITED",
   "recipient": null,
-  "payee": "NEPTUNE SHIPPING LIMITED (LAX)",
+  "payee": "NEPTUNE SHIPPING LIMITED",
   "payer": null,
+  "shipper": "YIWU JINBAIREN IMPORT AND EXPORT CO., LTD",
+  "consignee": "AEBO TCO IMPORT LLC",
+  "carrier": "NEPTUNE SHIPPING LIMITED",
   "bl_nos": [
     "MAEU275752922",
     "CGT260801188"

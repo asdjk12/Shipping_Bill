@@ -1,0 +1,6 @@
+{
+  "_comment": "golden 标注 -> 题目测试集（笔试题AIAGENT 目录）中的原件文件名",
+  "DN_DC-108478.expected_extraction.json": "PDF 示例账单2.pdf",
+  "INV_ZIM_ORFR1618731.expected_extraction.json": "图片示例.png",
+  "NOTICE_CMA_CMDUCHN4053601.expected_extraction.json": "PDF示例账单1.pdf"
+}

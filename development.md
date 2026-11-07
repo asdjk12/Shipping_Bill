@@ -130,7 +130,12 @@ shipping-bill-agent/
 │   │   └── local.py           # LocalOCR：按页组合文字层与 OCR
 │   ├── extract/
 │   │   ├── prompts.py
-│   │   └── extractor.py
+│   │   ├── extractor.py       # 抽取 + 代码核验 + 带反馈重试
+│   │   ├── numbers.py         # 数字查找与算术一致性
+│   │   ├── reviewer.py        # LLM 语义审核
+│   │   ├── gate.py            # 把关流程与重试上限
+│   │   ├── compare.py         # golden 对比
+│   │   └── review_eval.py     # 审核模型评测
 │   ├── normalize/
 │   │   ├── charge.py
 │   │   ├── currency.py
@@ -279,7 +284,7 @@ class OCRResult:
 
 用 `llm.with_structured_output(ExtractedDocument)` 做抽取，temperature 设为 0。
 
-**抽取结构只包含 test.pdf 要求的字段**（代码见 `src/bill_agent/models/extraction.py`）。单据上的其他信息，如船名、港口、结算条款、汇率、费用代码等，一律不抽取，后续业务需要时再加。`tests/unit/test_samples.py::test_schema_only_has_spec_fields` 锁定了字段集合：新增字段必须有题目依据，并同步修改这个测试。
+**抽取结构只包含 test.pdf 要求的字段**（代码见 `src/bill_agent/models/extraction.py`）。单据上的其他信息，如船名、港口、结算条款、汇率、单独一列的费用代码等，一律不抽取，后续业务需要时再加。`tests/unit/test_samples.py::test_schema_only_has_spec_fields` 锁定了字段集合：新增字段必须有题目依据，并同步修改这个测试。
 
 ```python
 class ExtractedCharge:                 # 每个费用项一条（四.4）
@@ -298,6 +303,7 @@ class ExtractedDocument:
     document_type_raw, reference_no, document_date_raw   # 单据类型、编号及日期（四.2）
     issuer, recipient                  # 签发方和接收方（四.2）
     payee, payer                       # 单据写明的收款方 / 付款方：收费方向（四.6）
+    shipper, consignee, carrier        # 寄件人、收件人、送货人，按语义判断，不依赖固定标签（用户确认的业务字段，不来自题目）
     bl_nos: list[str]                  # 提单号（四.5 规则 2）
     booking_no: str | None             # 订舱号（四.5 规则 3）
     container_nos: list[str]           # 箱号（四.5 规则 4）
@@ -329,14 +335,111 @@ class ExtractedDocument:
 | 同一封邮件写明 `FREIGHT PREPAID` | 只适用于运费，不能套用到 H/C 这笔费用上 |
 | 邮件正文嵌入的 `InsertPic_C25B.jpg` | OCR 后确认是邮件签名里的宣传横幅，不含费用 |
 
-Prompt 要点：
-- 只从**本单实际收费的费用行**抽取。条款或说明里的金额（如“取消 I.T. 收 $25”“司机等待 $150/小时”“误还箱 $1100”）是费率说明，不是费用；
-- 多页单据会重复页眉和地址块，同一费用只抽取一次；
-- 提单（MBL/HBL）不生成费用行，只抽取提单号、箱号等匹配信息；Pre-alert 等通知邮件只抽取**明确写出金额的费用**（如 `SHA pay TAR：H/C $50`），`Carrier Free H/C` 这类免收说明不生成费用；
-- 原文中没有的字段一律填 null，不要推测；
-- 金额只输出数字，去掉千分位和货币符号；
-- 每个非 null 字段都必须附上原文片段作为证据；
-- 原文表格按行逐条抽取，一行对应一个费用项。
+**实现**（`src/bill_agent/extract/`，状态：✅ 已实现）：
+
+```bash
+python -m bill_agent extract <文件或目录>... [--out output/extracted.json] [--max-retries 2]
+python -m bill_agent extract-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGENT" [--out output/extract_eval.json]
+```
+
+1. **分组**：一个上传文件及其所有附件为一组，一次 LLM 调用。邮件正文和附件一起交给模型，因为正文可能补充附件的信息，或者本身就是一笔收费。
+2. **模型输出结构**（`LLMExtraction`）专为模型设计，与 `ExtractedDocument` 分开：
+   - 金额让模型照抄原文字符串（如 `"1,310.40"`），由 `parse_amount` 解析。`4O.00` 这类 OCR 混淆会在解析时报错。
+   - 证据用 `[{field, quote}]` 列表，避开开放字典。
+   - `source_id` 不让模型填写：模型只给出 `source_doc`（"文档 N"），由代码映射；证据的来源文件由代码在原文中查找确定。
+3. **核验**（`convert`）：
+   - 通过 `ExtractedDocument` 的模型校验：金额可解析、证据字段名存在、行号唯一。
+   - 所有照抄字段（单据信息、交易双方、匹配键、币种、付款方式、费用名、证据摘录）都必须能在原文中找到（忽略空白和大小写）。
+   - 数字按完整数值比较（忽略千分位），`50` 不会误命中 `150`。
+   - 数量 × 单价、费用行加总、小计 + 税额必须与单据上的数字一致（比较绝对值，容差 0.01，按币种分组）。
+   - 签发方和接收方不能相同。
+   - 付款方式必须是已知写法（PP、CC、Prepaid、Collect 等）。单字母 `C`、`P` 只在有明确反证时不采信：单据有 Base / Basis 列，又没有付款方式列。不要求原文有固定列名，CMA 的 `C` 在 `AMOUNT TYPE` 列下，不受影响。
+   - **没有相关语义就留空（已确认，适用于任何输入文件）：** 由模型按语义判断，没有相关语义时填 null。单据级字段（`EVIDENCE_REQUIRED`）有值却没有证据摘录时，先退回让模型补摘录；重试用完仍没有才置为 null，并记入 `cleared`。值跨行时，摘录是值的一部分也算有依据。提单号、箱号和费用行不走这一条，它们逐项回原文查找。
+   - 不能一缺证据就清空：实测模型常常只是漏写摘录，或只引用 `REMIT TO` 这个标签，直接清空会丢掉 CMA 的签发方、收款方和 DN 的单据类型，审核也拦不住。
+   - 同一号码的不同写法（`CMDUCHN4053601` / `CMDU CHN4053601`）去重。
+4. **带反馈重试**：有问题时，把错误列表和上一次的输出发回模型，最多重试 2 次。模型没有按结构输出时（`include_raw` 拿到解析错误）也按同样方式重试。每次尝试的问题记在 `attempt_errors`，重试后仍未解决的记在 `errors`，由 6.3.1 的把关流程转为待人工复核。
+5. **golden 对比**（`extract/compare.py`）：文本字段忽略空白和大小写，提单号、箱号按集合比较，费用行按 `line_no` 对齐，合计按币种对齐，金额按数值比较。`tests/fixtures/samples/manifest.json` 记录 golden 与原件的对应关系。
+
+**Prompt**（`extract/prompts.py`）分两部分：
+
+- **输入格式说明**：文档分隔标记、layout 文本的列对齐、OCR 表格的 ` | `、分页标记、未归入版面块的文本、低置信度提示。
+- **抽取规则**：
+  - 只抽取本单实际收费的费用行，条款里的费率和免收费用不算。
+  - 邮件正文里写明金额的收费也要输出。
+  - 所有值逐字照抄原文，不翻译、不换算、不补全；没有的填 null。
+  - 费用名称栏照抄完整内容，包括其中的费用代码；公司名不带末尾的站点简称。
+  - 付款方式只取明确标注的列；单据级币种取单据头部或合计行写明的币种，只有费用行写了币种时不推断。
+  - payee / payer 只在原文明确写出时填写。
+  - 证据必须是同一行内的连续文字。
+
+**样例实测**（DeepSeek `deepseek-v4-pro`，`extract-eval`，2026-11-07，名称、carrier、币种口径确认后单次运行）：3 份 golden 共 90 个字段，87 个一致。DN 36/36，ZIM 30/30，CMA 21/24：
+
+| 差异 | 说明 |
+|---|---|
+| CMA 的 issuer、recipient、carrier 为 null | 值抽对了，但 3 次尝试的证据摘录都只引用了标签行（如 `REMIT TO ...`、`CONSIGNEE ... SECOND NOTIFY`），没有包含值，最后被置空并记入 `cleared`。流程仍判为通过 |
+
+此前同一天的两次运行里，ZIM 单价出现过一次 null，属于结果波动；`AS AGENTS FOR` 和 ZIM 单据级币种的差异已通过确认口径、修正 golden 消除。
+
+**名称写法（已确认）：**
+
+- 费用名称栏逐字照抄，不移除费用代码，CMA 的费用名是 `OCA17 On Carriage Additional - US Em`。
+- 公司名不带末尾的站点简称，DN 的 `NEPTUNE SHIPPING LIMITED (LAX)` 填 `NEPTUNE SHIPPING LIMITED`；名称中间的括号保留，如 `CMA CGM (AMERICA) LLC`。
+- 公司名不带代理说明，ZIM 的 `... Co., LLC As Agents for Zim Integrated Shipping Services Ltd.` 填 `... Co., LLC`。
+- 单据级币种取单据头部或合计行写明的币种：DN 的 `CURRENCY USD`、CMA 的 `TOTAL CHARGES TO BE PAID: USD`、ZIM 合计行的 `USD`。
+
+### 6.3.1 抽取质量把关
+
+**状态：已实现**，代码在 `extract/gate.py`、`extract/reviewer.py`、`extract/numbers.py`。抽取结果通过把关后才能进入标准化。
+
+```bash
+python -m bill_agent extract <文件或目录>... [--max-retries 2] [--max-review-retries 1] [--no-review] [--out ...]
+python -m bill_agent review-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGENT" [--out output/review_eval.json]
+```
+
+**分工：精确比对和算术用代码，语义判断用 LLM。** 代码不从原文里提取字段，而是拿抽取出的值回到原文查找，所以原文是整段文本也能核验。这一层防编造和算错，但查不出“值在原文里、却填错了字段”，这部分交给审核模型。
+
+| 步骤 | 执行者 | 失败时 |
+|---|---|---|
+| 值能否在原文中找到 | 代码（`convert`） | 带错误重抽，最多 `max_retries` 次，仍失败转待人工 |
+| 数字一致性、签发方不等于接收方 | 代码（`check_numbers`、`convert`） | 同上 |
+| 语义检查 | LLM（`Reviewer`） | 带审核意见重抽，最多 `max_review_retries` 次，仍有问题转待人工 |
+
+**审核模型：**
+
+- 输入原文和抽取结果，输出对每个字段的判断。值为 null 的字段也要审核，用来发现漏填；漏抽的费用行单独列在 `omissions`。
+- 只给判断，不改结果，保证每个数据都只来自抽取环节并有原文依据。
+- 判为有问题时必须附原文摘录，代码核验找不到的意见记入 `dismissed`，不算问题，但保留在输出里。
+- 没有覆盖全部字段时带着缺失列表再审一次，仍不完整就转待人工，不当作通过。
+- 与抽取使用同一份规则（`EXTRACTION_RULES`），另加审核专用要求。规则相同也意味着盲区相同：页面抬头印的是收件方时，审核模型和抽取模型会一起判错，这类情况靠代码的“签发方不等于接收方”拦下。
+- issuer / recipient 按语义判断：规则说明 SHIPPER、CONSIGNEE、NOTIFY 是货物各方，只作为判断依据，不直接等同账单双方。DN 的 CONSIGNEE 是 AEBO，与账单双方无关。
+
+**重试上限：** `ReviewGate.run_group` 返回 `passed` 或 `needs_review`，后者附 `reasons` 和每一轮的记录。一组文件最多调用模型：抽取 `(max_retries + 1) × (max_review_retries + 1)` 次，默认 6 次；审核 `(max_review_retries + 1) × 2` 次，默认 4 次。代码核验没通过时不调用审核模型。待人工只是一个状态，暂停、等待确认、继续处理的流程在 LangGraph 阶段实现，届时按状态连接条件分支。
+
+**评测（`review-eval`）：** golden 不应被误报；故意改坏的字段应被发现。改坏方式只动语义、不破坏算术（漏抽一行除外），例如签发方填成对方、单据号与提单号互换、数量与单价互换、收款方漏填，代码核验查不出来。
+
+**实测**（DeepSeek `deepseek-v4-pro`，2026-11-07）：
+
+| 样例 | golden 误报 | 改坏字段发现 |
+|---|---|---|
+| DN DC-108478 | 0 | 5 / 5 |
+| ZIM ORFR1618731 | 0 | 4 / 4 |
+| CMA Notice | 0 | 3 / 4 |
+
+完整流程 4 份样例各跑 3 次，共 12 次全部通过；golden 对比 85/90。付款方式、寄件人、收件人全部正确，DN、CMA 的交易方全部正确。
+
+**issuer 口径（已确认）：** 实际收取本单费用的航运公司，Credit Note 则是退款的一方，不看页面顶部印着谁。
+
+**货物三方：** 按语义判断，不依赖固定标签。邮件的寄件人和收件人取自 HBL。ZIM 的 `From` / `To` 是港口，发票上没有货主，两者为 null（已确认）。
+
+**送货人（已确认）：** carrier 只取决于谁收取本单费用：收取本单费用的航运公司就是 carrier，不看船名、船属于哪家公司或提单号前缀。ZIM 的 carrier 是 ZIM American（收费方）。提单上的 SHIPPER、FORWARDING AGENT 不是送货人。邮件的 carrier 为 null。
+
+**已知问题：**
+
+- ZIM 的 issuer 有 1 次因证据写法不一致（`Co., LLC` / `CO.LLC`）被置空，流程仍判为通过：`cleared` 只记录，不转人工。
+- 要求单据级字段都有证据后，重抽明显变多：CMA 最多用 6 次抽取，邮件每次用满 3 次。
+
+- CMA 只有一行费用时，漏抽这一行查不出来；有总计但没有费用行时，代码还不报错。
+- API 报错（如余额不足）会中断整批，已完成的结果不会保存。
 
 ### 6.4 标准化
 
@@ -344,7 +447,7 @@ Prompt 要点：
 |---|---|---|
 | 费用名称 | **只改写题目标准化表中列出的名称**：先把大小写、空格、标点统一，再与表中的原始名称和标准名称做精确匹配，命中则输出标准名称。例如 DN 的 `HANDLING CHARGE` 会输出为 `Handling Charge` | 表中没有的名称**原样照抄**（例如 `4 ADD'L DETENTION FREE TIME CHARGE`、`WHARFAGE`），不做模糊匹配，不交给 LLM 改写，也不因此标 PENDING_REVIEW |
 | 币种 | 查别名表（`US$`/`USD$` → USD，`RMB`/`¥`/`CNY` → CNY），再用 ISO 4217 白名单校验 | 不合法则标 `PENDING_REVIEW` |
-| 付款方式 | `PP`/`Prepaid`/`Freight Prepaid`/`预付` → PP；`CC`/`Collect`/`到付` → CC | 填 null |
+| 付款方式 | `PP`/`P`/`Prepaid`/`Freight Prepaid`/`预付`/`寄付` → PP；`CC`/`C`/`Collect`/`到付` → CC（单字母已确认） | 填 null |
 
 标准化表（题目给定，放在 `config/charge_mapping.yaml`，后续可扩展）：
 
@@ -476,10 +579,12 @@ PAT 的别名表（**已确认**）：`PAT`、`Pilot Aiship Tech co., Ltd.`、`�
 
 | 样例 | 收款方 ← 付款方 | 结果 |
 |---|---|---|
-| DN DC-108478 | Neptune ← Pilot Aiship Tech（PAT） | `AP` |
+| DN DC-108478 | Neptune ← AEBO（到付，收件人付款） | `null`（PAT 不是寄件人、收件人或送货人） |
 | ZIM Invoice ORFR1618731 | ZIM ← All America Forwarding | `null` |
 | CMA CGM Notice（PDF示例账单1） | CMA CGM ← Neptune | `null` |
 | Pre-alert 邮件（H/C $50） | TAR ← SHA | `null`（SHA 和 TAR 都不是 PAT） |
+
+**待调整（M4 实现时处理）：** 下方 `decide_posting_type` 在只有收款方时，用签发方推出付款方。PAT 只是印在抬头时，这会把 DN 算成 AP，与上表的 `null` 不符。实现时应改为：付款方没有写明时按付款方式判断，到付取 consignee，寄付取 shipper。
 
 **第 4 步：用付款方式做交叉校验（辅助信号）。** PP 费用通常由起运港一方收取，CC 费用通常由目的港一方收取。如果主体的角色已知（Origin 或 Destination），而 PP/CC 推出的结论与第 3 步矛盾，就降低置信度并在审计中说明。这一步不推翻主判据。
 
@@ -661,7 +766,7 @@ python -m bill_agent run \
 | M0 | 下载样例数据；OCR 接口约定 | `ocr/interface.py` ✅ |
 | M1 | 数据模型；EML / Excel / Word 解析器；Router 递归；PDF / 图片登记为待 OCR | 解析器 + 单元测试 ✅ |
 | M1.5 | 本地 OCR：PDF 文字层 + PaddleOCR PP-StructureV3 | `ocr/local.py` + 单元测试 ✅ |
-| M2 | LLM 结构化抽取 + 证据；标准化模块 | 抽取结果达到可用水平 |
+| M2 | LLM 结构化抽取 + 证据；质量把关；标准化模块 | 抽取 ✅（golden 78/81 字段一致）；质量把关 ✅；标准化待做 |
 | M3 | 校验模块；SQLite 账单库；JSON 导入 | |
 | M4 | 4 级匹配；操作判定；字段级 diff；AR/AP 规则 | 核心业务闭环 |
 | M5 | LangGraph 编排；重试与置信度；审计输出 | 端到端可运行 |
