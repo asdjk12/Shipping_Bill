@@ -9,7 +9,7 @@ from pathlib import Path
 from langchain_core.runnables import RunnableLambda
 
 from bill_agent.extract import Extractor, GateStatus, ReviewGate, Reviewer
-from bill_agent.extract.extractor import LLMExtraction, convert
+from bill_agent.extract.extractor import LLMExtraction, LLMPatch, convert
 from bill_agent.extract.numbers import check_numbers, numbers_in
 from bill_agent.extract.review_eval import detected, mutations
 from bill_agent.extract.reviewer import LLMReview, ReviewIssue, ReviewResult, flatten
@@ -23,9 +23,9 @@ SAMPLES = Path(__file__).parents[1] / "fixtures" / "samples"
 class ScriptedLLM:
     """抽取和审核各按顺序返回预设输出，用完后重复最后一个。"""
 
-    def __init__(self, extractions: list[dict], reviews: list[dict | None]):
-        self.script = {LLMExtraction: extractions, LLMReview: reviews}
-        self.calls = {LLMExtraction: [], LLMReview: []}
+    def __init__(self, extractions: list[dict], reviews: list[dict | None], patches: list[dict] | None = None):
+        self.script = {LLMExtraction: extractions, LLMReview: reviews, LLMPatch: patches or [{}]}
+        self.calls = {LLMExtraction: [], LLMReview: [], LLMPatch: []}
 
     def with_structured_output(self, schema, include_raw=False, **kw):
         def run(messages):
@@ -177,7 +177,16 @@ def test_gate_skips_review_when_code_checks_fail():
     llm = ScriptedLLM([bad], [{}])
     r = gate(llm).run_group([doc("d", DN_TEXT)])
     assert r.status is GateStatus.NEEDS_REVIEW and any("DC-000000" in e for e in r.reasons)
-    assert len(llm.calls[LLMExtraction]) == 2 and llm.calls[LLMReview] == []   # max_retries=1
+    assert len(llm.calls[LLMExtraction]) == 1 and len(llm.calls[LLMPatch]) == 1   # max_retries=1，重试只补字段
+    assert llm.calls[LLMReview] == []
+
+
+def test_gate_sends_cleared_fields_to_human_review():
+    no_evidence = dn_output(issuer="MAEU275752922")
+    llm = ScriptedLLM([no_evidence], [all_ok(no_evidence)])
+    r = gate(llm).run_group([doc("d", DN_TEXT)])
+    assert r.status is GateStatus.NEEDS_REVIEW
+    assert r.reasons == ["证据不足被清空，需人工确认: 单据 1 issuer='MAEU275752922'"]
 
 
 def test_gate_flags_unfinished_review():

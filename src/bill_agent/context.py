@@ -36,3 +36,8 @@ def verify_evidence(evidence: list[str], context: str) -> list[bool]:
     """忽略空白和大小写后，摘录必须是上下文的子串。"""
     ctx = squash(context)
     return [bool(squash(e)) and squash(e) in ctx for e in evidence]
+
+
+def loose(s: str) -> str:
+    """比 squash 更宽松：再去掉标点。公司名的不同写法（"CO.LLC" / "Co., LLC"）视为相同。"""
+    return re.sub(r"[\W_]+", "", s).lower()

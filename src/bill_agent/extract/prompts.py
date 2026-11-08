@@ -83,6 +83,21 @@ RETRY_PROMPT = """上一次的输出没有通过校验：
 
 请修正这些问题，重新输出完整的抽取结果。原文里确实没有的内容填 null，不要编造。"""
 
+PATCH_PROMPT = """上一次的输出没有通过校验，只需要修正下面列出的问题，其他内容保持不变：
+{errors}
+
+上一次的输出：
+{previous}
+
+只输出需要修正的内容，不要重复输出整份结果：
+- fields：单据级字段的问题。每项给出单据序号 document（上一次输出中 documents 的第几项，从 1 开始）、
+  字段名 field、对照原文核实后的值 value（bl_nos、container_nos 用 values 列表给出完整取值），
+  以及包含该值的原文摘录 quote（同一行内连续的文字）。原文确实没有该信息时 value 填 null。
+  totals 的证据有问题时也在 fields 里给出：field 填 totals，只给 quote，value 留空。
+- prices：价格的问题。只对照原文复核这张单据的价格：charges 按 line_no 给出每个费用行的
+  quantity、unit_price、amount（照抄原文写法）和证据；totals 给出单据上写明的合计，不需要修改时填 null。
+  不要增删费用行，不要修改费用名称。"""
+
 REVIEW_SYSTEM_PROMPT = ("""你是航运财务单据抽取结果的审核员。另一个模型已按下面的抽取规则从文件中抽取了结构化信息。
 你对照原文判断抽取结果的语义是否正确，只给出判断，不修改结果。
 

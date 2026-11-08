@@ -10,7 +10,8 @@ from langchain_core.runnables import RunnableLambda
 
 from bill_agent.extract import Extractor, group_documents
 from bill_agent.extract.compare import compare
-from bill_agent.extract.extractor import EVIDENCE_REQUIRED, LLMExtraction, convert, has_support, payment_term_problem
+from bill_agent.extract.extractor import (EVIDENCE_REQUIRED, LLMExtraction, LLMPatch, anchored_evidence,
+                                           apply_patch, convert, has_support, payment_term_problem)
 from bill_agent.models import DocStatus, ExtractedDocument, FileType, RawDocument
 
 SAMPLES = Path(__file__).parents[1] / "fixtures" / "samples"
@@ -53,21 +54,23 @@ def dn_output(**over) -> dict:
 
 
 class FakeLLM:
-    """按顺序返回预设输出，记录每次收到的消息。"""
+    """按顺序返回预设输出（整份抽取和补问题共用一个序列），记录每次收到的消息和输出结构。"""
 
     def __init__(self, *outputs: dict):
         self.outputs = list(outputs)
         self.calls = []
+        self.schemas = []
 
     def with_structured_output(self, schema, include_raw=False, **kw):
-        assert schema is LLMExtraction and include_raw
+        assert schema in (LLMExtraction, LLMPatch) and include_raw
 
         def run(messages):
             self.calls.append(messages)
+            self.schemas.append(schema)
             out = self.outputs[min(len(self.calls), len(self.outputs)) - 1]
             if out is None:                 # 模拟模型没有按结构输出
                 return {"raw": "随便说点什么", "parsed": None, "parsing_error": ValueError("not json")}
-            return {"raw": None, "parsed": LLMExtraction.model_validate(out), "parsing_error": None}
+            return {"raw": None, "parsed": schema.model_validate(out), "parsing_error": None}
         return RunnableLambda(run)
 
 
@@ -215,42 +218,128 @@ def test_convert_clears_every_document_field_without_evidence():
 
 
 def test_missing_evidence_is_retried_before_clearing():
-    no_evidence = dn_output(issuer="DC-108478")
-    with_evidence = dn_output(issuer="DC-108478")
-    with_evidence["documents"][0]["evidence"].append({"field": "issuer", "quote": "DC-108478"})
+    no_evidence = dn_output(issuer="MAEU275752922")
+    fix = {"fields": [{"document": 1, "field": "issuer", "value": "MAEU275752922",
+                       "quote": "MASTER B/L NO. : MAEU275752922"}]}
 
-    llm = FakeLLM(no_evidence, with_evidence)
+    llm = FakeLLM(no_evidence, fix)
     r = Extractor(llm, max_retries=2).extract_group([doc("d", DN_TEXT)])
     assert r.attempts == 2 and r.errors == [] and r.cleared == []
-    assert r.documents[0].issuer == "DC-108478"        # 模型补了证据，值保留
+    assert r.attempt_modes == ["full", "patch"]       # 第二次只补证据，不重新整份抽取
+    assert r.documents[0].issuer == "MAEU275752922"    # 模型补了证据，值保留
     assert "没有包含该值的证据摘录" in llm.calls[1][-1].content
 
-    llm = FakeLLM(no_evidence)
+    llm = FakeLLM(no_evidence, {})
     r = Extractor(llm, max_retries=1).extract_group([doc("d", DN_TEXT)])
     assert r.attempts == 2 and r.errors == []          # 重试用完才清空
-    assert r.documents[0].issuer is None and r.cleared == ["单据 1 issuer='DC-108478'"]
+    assert r.documents[0].issuer is None and r.cleared == ["单据 1 issuer='MAEU275752922'"]
+
+
+# 邮件附件 MBL 的多栏排版：标签和值分在上下两行
+MBL_TEXT = """SHIPPER                                       BOOKING NUMBER   B/L NO:
+SUN TRACK EXPRESS (CHINA) CO., LTD.           4055331281       HZMHK331281
+ROOM 1201, SHENZHEN
+CONSIGNEE
+ACME LOGISTICS LLC
+FREIGHT COLLECT                               SHIPPED ON BOARD"""
+
+
+def test_anchored_evidence_label_above_value():
+    g = [doc("m", MBL_TEXT)]
+    # 模型把两行拼成一句：原文里没有这句，但标签在值的上一行
+    ev = anchored_evidence("4055331281", "BOOKING NUMBER 4055331281", g)
+    assert ev and ev["source_id"] == "m"
+    assert ev["quote"].startswith("SHIPPER") and "4055331281" in ev["quote"]   # 证据是原文的连续两行
+    # 只引用了标签行
+    assert anchored_evidence("4055331281", "BOOKING NUMBER", g)
+    assert anchored_evidence("ACME LOGISTICS LLC", "CONSIGNEE", g)
+
+
+def test_anchored_evidence_rejects_label_not_near_value():
+    g = [doc("m", MBL_TEXT)]
+    assert anchored_evidence("4055331281", "VESSEL NAME 4055331281", g) is None      # 标签原文没有
+    assert anchored_evidence("4055331281", "SHIPPED ON BOARD", g) is None            # 标签在值下面
+    assert anchored_evidence("ACME LOGISTICS LLC", "BOOKING NUMBER", g) is None      # 隔了 4 行
+    assert anchored_evidence("9999999999", "BOOKING NUMBER 9999999999", g) is None   # 值不在原文
+    assert anchored_evidence("4055331281", "4055331281", g) is None                  # 没有标签
+
+
+def test_convert_accepts_stitched_quote_without_retry():
+    mail = doc("m", MAIL_TEXT, FileType.EML)
+    mbl = doc("a", MBL_TEXT, parent="m")
+    out = {"documents": [{
+        "source_doc": 1, "payer": "SHA", "payee": "TAR", "booking_no": "4055331281", "consignee": "ACME LOGISTICS LLC",
+        "charges": [{"line_no": 1, "charge_name_raw": "H/C", "amount": "50", "currency_raw": "$"}],
+        "evidence": [{"field": "payee", "quote": "SHA pay TAR"}, {"field": "payer", "quote": "SHA pay TAR"},
+                     {"field": "booking_no", "quote": "BOOKING NUMBER 4055331281"},   # 拼接
+                     {"field": "consignee", "quote": "CONSIGNEE"}],                   # 只有标签
+    }]}
+    [d], errors = convert(LLMExtraction.model_validate(out), [mail, mbl], clear_unsupported=False)
+    assert errors == []                              # 不再退回模型
+    assert d.booking_no == "4055331281" and d.consignee == "ACME LOGISTICS LLC"
+    assert d.evidence["booking_no"].source_id == "a"
+    assert "4055331281" in d.evidence["booking_no"].quote
 
 
 def test_convert_clears_cargo_parties_without_evidence():
     text = DN_TEXT + "\nSHIPPER : YIWU CO\nCONSIGNEE : AEBO LLC"
     out = dn_output(shipper="YIWU CO", consignee="AEBO LLC")
     out["documents"][0]["evidence"] += [{"field": "shipper", "quote": "SHIPPER : YIWU CO"},
-                                        {"field": "consignee", "quote": "CONSIGNEE :"}]
+                                        {"field": "consignee", "quote": "D/C No. : DC-108478"}]
     [d], errors = convert(LLMExtraction.model_validate(out), [doc("d", text)])
     assert errors == []
     assert d.shipper == "YIWU CO"     # 证据包含值
-    assert d.consignee is None        # 证据不含值，等于没有证据
+    assert d.consignee is None        # 证据不含值，值附近也没有这段文字，等于没有证据
 
     out = dn_output(shipper="YIWU CO", consignee="AEBO LLC")
     [d], errors = convert(LLMExtraction.model_validate(out), [doc("d", text)])
     assert errors == [] and d.shipper is None and d.consignee is None
 
-    out = dn_output(carrier="DC-108478")         # 送货人同样要有证据
+    out = dn_output(carrier="MAEU275752922")         # 送货人同样要有证据
     [d], _ = convert(LLMExtraction.model_validate(out), [doc("d", text)])
     assert d.carrier is None
-    out["documents"][0]["evidence"].append({"field": "carrier", "quote": "D/C No. : DC-108478"})
+    out["documents"][0]["evidence"].append({"field": "carrier", "quote": "MASTER B/L NO. : MAEU275752922"})
     [d], _ = convert(LLMExtraction.model_validate(out), [doc("d", text)])
-    assert d.carrier == "DC-108478"
+    assert d.carrier == "MAEU275752922"
+
+
+def test_convert_reuses_evidence_of_another_field():
+    # carrier 的摘录只有公司名的一部分，但 issuer 的证据已经包含完整的公司名
+    text = DN_TEXT + "\nREMIT TO\nACME SHIPPING (AMERICA) LLC\ncharges are payable to ACME SHIPPING"
+    out = dn_output(issuer="ACME SHIPPING (AMERICA) LLC", carrier="ACME SHIPPING (AMERICA) LLC")
+    out["documents"][0]["evidence"] += [{"field": "issuer", "quote": "ACME SHIPPING (AMERICA) LLC"},
+                                        {"field": "carrier", "quote": "charges are payable to ACME SHIPPING"}]
+    [d], errors = convert(LLMExtraction.model_validate(out), [doc("d", text)], clear_unsupported=False)
+    assert errors == [] and d.carrier == "ACME SHIPPING (AMERICA) LLC"
+    assert d.evidence["carrier"].quote == "ACME SHIPPING (AMERICA) LLC"
+
+
+def test_company_name_punctuation_ignored():
+    # "CO.LLC" 与 "Co., LLC" 视为相同
+    text = DN_TEXT + "\nZIMAMERICAN SERVICESCO.LLC AS AGENTS"
+    assert has_support("ZIM AMERICAN SERVICES Co., LLC", "ZIMAMERICAN SERVICESCO.LLC AS AGENTS")
+    out = dn_output(issuer="ZIM AMERICAN SERVICES Co., LLC")
+    out["documents"][0]["evidence"].append({"field": "issuer", "quote": "ZIMAMERICAN SERVICESCO.LLC AS AGENTS"})
+    [d], errors = convert(LLMExtraction.model_validate(out), [doc("d", text)], clear_unsupported=False)
+    assert errors == [] and d.issuer == "ZIM AMERICAN SERVICES Co., LLC"
+    assert compare(d, d.model_copy(update={"issuer": "ZIM AMERICAN SERVICES CO.LLC"}))[1] == []
+
+
+def test_convert_flags_booking_label_without_value():
+    mail = doc("m", MAIL_TEXT, FileType.EML)
+    mbl = doc("a", MBL_TEXT, parent="m")
+    out = {"documents": [{
+        "source_doc": 1, "payer": "SHA", "payee": "TAR",
+        "charges": [{"line_no": 1, "charge_name_raw": "H/C", "amount": "50", "currency_raw": "$"}],
+        "evidence": [{"field": "payee", "quote": "SHA pay TAR"}, {"field": "payer", "quote": "SHA pay TAR"}],
+    }]}
+    _, errors = convert(LLMExtraction.model_validate(out), [mail, mbl])
+    assert len(errors) == 1 and errors[0].kind == "field" and errors[0].field == "booking_no"
+    assert "BOOKING NUMBER" in errors[0]
+    # 补问题的轮次不再检查：模型核实后仍填 null 就接受
+    assert convert(LLMExtraction.model_validate(out), [mail, mbl], check_omissions=False)[1] == []
+    # 原文没有订舱号标签时不报
+    assert convert(LLMExtraction.model_validate(dn_output()), [doc("d", DN_TEXT)])[1] == []
 
 
 def test_convert_rejects_same_issuer_and_recipient():
@@ -265,9 +354,12 @@ def test_convert_rejects_same_issuer_and_recipient():
 
 def test_retry_with_feedback_then_pass():
     bad = dn_output(reference_no="DC-000000")
-    llm = FakeLLM(bad, dn_output())
+    fix = {"fields": [{"document": 1, "field": "reference_no", "value": "DC-108478",
+                       "quote": "D/C No. : DC-108478"}]}
+    llm = FakeLLM(bad, fix)
     r = Extractor(llm, max_retries=2).extract_group([doc("d", DN_TEXT)])
     assert r.attempts == 2 and r.errors == []
+    assert llm.schemas == [LLMExtraction, LLMPatch] and r.documents[0].reference_no == "DC-108478"
     assert len(r.raw_outputs) == 2
     assert len(r.attempt_errors) == 2 and r.attempt_errors[1] == []
     assert any("DC-000000" in e for e in r.attempt_errors[0])
@@ -290,11 +382,52 @@ def test_retry_exhausted_keeps_errors():
 
 
 def test_feedback_stays_through_inner_retries():
-    bad = dn_output(reference_no="DC-000000")
+    bad = dn_output(source_doc=5)        # 结构性问题，整份重新抽取
     llm = FakeLLM(bad, dn_output())
     Extractor(llm).extract_group([doc("d", DN_TEXT)], ["审核意见 A"], {"documents": []})
+    assert llm.schemas == [LLMExtraction, LLMExtraction]
     assert "审核意见 A" in llm.calls[0][-1].content
-    assert "审核意见 A" in llm.calls[1][-1].content and "DC-000000" in llm.calls[1][-1].content
+    assert "审核意见 A" in llm.calls[1][-1].content and "超出文档编号范围" in llm.calls[1][-1].content
+
+
+def test_price_mismatch_only_rechecks_prices():
+    # 费用行加总与合计不一致：只让模型复核价格，费用名等其他内容不动
+    bad = dn_output()
+    bad["documents"][0]["charges"][1]["amount"] = "65.00"
+    bad["documents"][0]["charges"][1]["unit_price"] = "65.00"
+    fix = {"prices": [{"document": 1, "charges": [
+        {"line_no": 1, "quantity": "1.00", "unit_price": "65.00", "amount": "65.00"},
+        {"line_no": 2, "quantity": "1.00", "unit_price": "35.00", "amount": "35.00"}]}]}
+    llm = FakeLLM(bad, fix)
+    r = Extractor(llm).extract_group([doc("d", DN_TEXT)])
+    assert r.errors == [] and r.attempt_modes == ["full", "patch"]
+    assert all(e.kind == "price" for e in r.attempt_errors[0])
+    assert [str(c.amount) for c in r.documents[0].charges] == ["65.00", "35.00"]
+    assert r.documents[0].charges[0].evidence["amount"].quote == "C      65.00"   # 没给新证据时保留原证据
+
+
+def test_apply_patch_only_touches_listed_fields():
+    prev = dn_output(issuer="X")
+    patched = apply_patch(prev, LLMPatch.model_validate({"fields": [
+        {"document": 1, "field": "issuer", "value": None},
+        {"document": 1, "field": "bl_nos", "values": ["A1", "B2"], "quote": "A1"},
+        {"document": 1, "field": "charges", "value": "忽略"},          # 不允许改的字段
+        {"document": 9, "field": "issuer", "value": "忽略"}]}))        # 不存在的单据
+    d = patched["documents"][0]
+    assert d["issuer"] is None and d["bl_nos"] == ["A1", "B2"]
+    assert {"field": "bl_nos", "quote": "A1"} in d["evidence"]
+    assert d["charges"] == prev["documents"][0]["charges"] and prev["documents"][0]["issuer"] == "X"
+
+
+def test_totals_evidence_can_be_patched():
+    bad = dn_output()
+    bad["documents"][0]["evidence"].append({"field": "totals", "quote": "TOTAL USD 100.00"})   # 原文没有这句
+    fix = {"fields": [{"document": 1, "field": "totals", "quote": "TOTAL AMOUNT 100.00"}]}
+    llm = FakeLLM(bad, fix)
+    r = Extractor(llm).extract_group([doc("d", DN_TEXT)])
+    assert r.errors == [] and r.attempt_modes == ["full", "patch"]
+    d = r.documents[0]
+    assert d.evidence["totals"].quote == "TOTAL AMOUNT 100.00" and str(d.totals[0].total_amount) == "100.00"
 
 
 def test_extract_no_bills():

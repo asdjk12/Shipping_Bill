@@ -7,6 +7,7 @@
 2. 仍有问题 -> NEEDS_REVIEW，不再调用审核模型
 3. LLM 审核。发现问题时把意见和本次输出退回抽取，最多 max_review_retries 次
 4. 超过上限，或审核本身没有完成 -> NEEDS_REVIEW，附上理由
+5. 审核通过，但有字段因为没有证据被清空（ExtractionResult.cleared）-> NEEDS_REVIEW
 
 一组文件最多的模型调用次数：
     抽取 (max_retries + 1) × (max_review_retries + 1)，审核 (max_review_retries + 1) × 2
@@ -75,6 +76,9 @@ class ReviewGate:
             if review.incomplete:
                 return done(GateStatus.NEEDS_REVIEW, [f"审核未完成: {review.incomplete}"])
             if not review.issues:
+                if extraction.cleared:      # 值因为没有证据被清空，可能丢了正确的信息，要人工确认
+                    return done(GateStatus.NEEDS_REVIEW,
+                                [f"证据不足被清空，需人工确认: {c}" for c in extraction.cleared])
                 return done(GateStatus.PASSED, [])
 
             log.info("审核退回: %s", review.issues)

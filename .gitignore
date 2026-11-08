@@ -14,3 +14,4 @@ data/ocr_cache/
 tests/fixtures/samples/*.pdf
 tests/fixtures/samples/*.png
 tests/fixtures/qa
+temp

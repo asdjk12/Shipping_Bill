@@ -1,6 +1,6 @@
 """抽取结果与 golden 标注逐字段对比。
 
-- 文本字段忽略空白和大小写；列表字段（提单号、箱号）按集合比较
+- 文本字段忽略空白和大小写；公司名再忽略标点（"CO.LLC" 与 "Co., LLC" 相同）；列表字段（提单号、箱号）按集合比较
 - 费用行按 line_no 对齐，合计按币种对齐；金额按数值比较
 - evidence、source_id 不参与比较（证据写法可以不同，已由抽取核验保证能在原文中找到）
 """
@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from bill_agent.context import squash
+from bill_agent.context import loose, squash
 from bill_agent.models import ExtractedDocument
 
 DOC_FIELDS = ["document_type_raw", "reference_no", "document_date_raw", "issuer", "recipient",
               "payee", "payer", "shipper", "consignee", "carrier", "booking_no", "currency_raw"]
+PARTY_FIELDS = {"issuer", "recipient", "payee", "payer", "shipper", "consignee", "carrier"}
 LIST_FIELDS = ["bl_nos", "container_nos"]
 CHARGE_FIELDS = ["charge_name_raw", "quantity", "unit_price", "amount", "currency_raw", "payment_term_raw"]
 TOTAL_FIELDS = ["subtotal", "tax_amount", "total_amount"]
@@ -44,7 +45,10 @@ def compare(expected: ExtractedDocument, actual: ExtractedDocument) -> tuple[int
             diffs.append(Diff(name, e, a))
 
     for f in DOC_FIELDS:
-        check(f, getattr(expected, f), getattr(actual, f))
+        e, a = getattr(expected, f), getattr(actual, f)
+        if f in PARTY_FIELDS and e and a and loose(e) == loose(a):
+            a = e
+        check(f, e, a)
     for f in LIST_FIELDS:
         check(f, sorted(map(squash, getattr(expected, f))), sorted(map(squash, getattr(actual, f))))
 

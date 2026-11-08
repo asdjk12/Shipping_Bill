@@ -338,7 +338,7 @@ class ExtractedDocument:
 **实现**（`src/bill_agent/extract/`，状态：✅ 已实现）：
 
 ```bash
-python -m bill_agent extract <文件或目录>... [--out output/extracted.json] [--max-retries 2]
+python -m bill_agent extract <文件或目录>... [--out output/extracted.json] [--max-retries 3]
 python -m bill_agent extract-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGENT" [--out output/extract_eval.json]
 ```
 
@@ -350,15 +350,27 @@ python -m bill_agent extract-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGE
 3. **核验**（`convert`）：
    - 通过 `ExtractedDocument` 的模型校验：金额可解析、证据字段名存在、行号唯一。
    - 所有照抄字段（单据信息、交易双方、匹配键、币种、付款方式、费用名、证据摘录）都必须能在原文中找到（忽略空白和大小写）。
+     单据级字段的值和"摘录是否包含值"的比对还忽略标点：公司名 `CO.LLC` 与 `Co., LLC` 视为相同。
    - 数字按完整数值比较（忽略千分位），`50` 不会误命中 `150`。
    - 数量 × 单价、费用行加总、小计 + 税额必须与单据上的数字一致（比较绝对值，容差 0.01，按币种分组）。
    - 签发方和接收方不能相同。
    - 付款方式必须是已知写法（PP、CC、Prepaid、Collect 等）。单字母 `C`、`P` 只在有明确反证时不采信：单据有 Base / Basis 列，又没有付款方式列。不要求原文有固定列名，CMA 的 `C` 在 `AMOUNT TYPE` 列下，不受影响。
    - **没有相关语义就留空（已确认，适用于任何输入文件）：** 由模型按语义判断，没有相关语义时填 null。单据级字段（`EVIDENCE_REQUIRED`）有值却没有证据摘录时，先退回让模型补摘录；重试用完仍没有才置为 null，并记入 `cleared`。值跨行时，摘录是值的一部分也算有依据。提单号、箱号和费用行不走这一条，它们逐项回原文查找。
    - 不能一缺证据就清空：实测模型常常只是漏写摘录，或只引用 `REMIT TO` 这个标签，直接清空会丢掉 CMA 的签发方、收款方和 DN 的单据类型，审核也拦不住。
+   - **摘录不合格时由代码回原文找证据**（`anchored_evidence`）：多栏排版中标签和值分在上下两行，模型常把两行拼成一句（`BOOKING NUMBER 4055331281`），或只引用标签行。代码在原文中找到包含值的行，摘录里的标签出现在这一行或上面 3 行内时，用原文从标签行到值所在行的连续片段作为证据。找不到标签时仍退回模型，防止把不相干的数字当成字段值。
+   - **复用同一张单据里的证据**：摘录不含完整值（如 CMA carrier 只引用了 `...payable to CMA CGM`），而同一张单据里别的字段的证据已经包含这个值时（issuer 的证据含 `CMA CGM (AMERICA) LLC`），直接复用。
+   - **漏抽检查**（`OMISSION_LABELS`）：原文有 `BOOKING NUMBER` 这类标签、`booking_no` 却为空时，作为问题退回模型核实。只在整份抽取的轮次检查，模型核实后仍填 null 就接受。DN、CMA 原文没有这个标签，不会误报。
    - 同一号码的不同写法（`CMDUCHN4053601` / `CMDU CHN4053601`）去重。
-4. **带反馈重试**：有问题时，把错误列表和上一次的输出发回模型，最多重试 2 次。模型没有按结构输出时（`include_raw` 拿到解析错误）也按同样方式重试。每次尝试的问题记在 `attempt_errors`，重试后仍未解决的记在 `errors`，由 6.3.1 的把关流程转为待人工复核。
-5. **golden 对比**（`extract/compare.py`）：文本字段忽略空白和大小写，提单号、箱号按集合比较，费用行按 `line_no` 对齐，合计按币种对齐，金额按数值比较。`tests/fixtures/samples/manifest.json` 记录 golden 与原件的对应关系。
+4. **带反馈重试，只补问题字段**：第一次把全部原文交给模型，整份抽取。之后最多重试 3 次（`max_retries`），按问题类型（`Problem.kind`）决定怎么重试：
+
+   | 问题类型 | 例子 | 下一轮 |
+   |---|---|---|
+   | `field`：单据级字段的值或证据 | 证据摘录不含值、值在原文中找不到、订舱号漏抽、totals 的证据找不到 | 只把这些问题发给模型，模型按 `LLMPatch.fields` 给出字段的新值和摘录 |
+   | `price`：价格 | 费用行加总与合计不一致、数量 × 单价 ≠ 金额、金额在原文中找不到或无法解析 | 只让模型对照原文复核这张单据的数量、单价、金额和合计（`LLMPatch.prices`），不增删费用行、不改费用名 |
+   | `other`：结构性问题 | 单据序号越界、费用名找不到、付款方式不合格、签发方等于接收方、模型没有按结构输出 | 把错误和上一次的输出发回，整份重新抽取 |
+
+   一轮的问题全部是 `field` / `price` 时才只补问题；模型给出的修正由 `apply_patch` 合并进上一次的完整输出，其他字段不变，再整体重新核验。每次尝试的问题记在 `attempt_errors`，方式（`full` / `patch`）记在 `attempt_modes`，修正内容记在 `patches`。重试后仍未解决的记在 `errors`，由 6.3.1 的把关流程转为待人工复核。
+5. **golden 对比**（`extract/compare.py`）：文本字段忽略空白和大小写，公司名字段再忽略标点，提单号、箱号按集合比较，费用行按 `line_no` 对齐，合计按币种对齐，金额按数值比较。`tests/fixtures/samples/manifest.json` 记录 golden 与原件的对应关系。
 
 **Prompt**（`extract/prompts.py`）分两部分：
 
@@ -372,13 +384,19 @@ python -m bill_agent extract-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGE
   - payee / payer 只在原文明确写出时填写。
   - 证据必须是同一行内的连续文字。
 
-**样例实测**（DeepSeek `deepseek-v4-pro`，`extract-eval`，2026-11-07，名称、carrier、币种口径确认后单次运行）：3 份 golden 共 90 个字段，87 个一致。DN 36/36，ZIM 30/30，CMA 21/24：
+**样例实测**（DeepSeek `deepseek-v4-pro`，`max_retries=3`，2026-11-08）：
 
-| 差异 | 说明 |
-|---|---|
-| CMA 的 issuer、recipient、carrier 为 null | 值抽对了，但 3 次尝试的证据摘录都只引用了标签行（如 `REMIT TO ...`、`CONSIGNEE ... SECOND NOTIFY`），没有包含值，最后被置空并记入 `cleared`。流程仍判为通过 |
+- `extract-eval` 跑两次，3 份 golden 共 90 个字段，两次都是 **90 / 90**。
+- 完整流程（抽取 + 审核）4 份样例各跑一次，全部通过；ZIM 修正 totals 证据的问题后又跑了 2 次，都通过。
 
-此前同一天的两次运行里，ZIM 单价出现过一次 null，属于结果波动；`AS AGENTS FOR` 和 ZIM 单据级币种的差异已通过确认口径、修正 golden 消除。
+| 样例 | 抽取模型调用 | 重试内容 |
+|---|---|---|
+| CMA | 1 次 | 无，issuer、carrier 都保留 |
+| DN | 2 次 | 只补 `document_type_raw` 的证据 |
+| ZIM | 2 次 | 补日期和 totals 的证据，并复核数量列被填成 `C` / `TT` 的价格 |
+| 邮件 | 2 次 | 漏抽检查发现订舱号为空，补回 `4055331281` |
+
+改动前（同日上午）是 87 / 90：CMA 的 issuer、recipient、carrier 因摘录只引用了标签行被清空；邮件订舱号因摘录拼接了上下两行被清空。重试改为只补问题字段前，CMA 最多要抽 6 次，邮件每次用满 3 次。
 
 **名称写法（已确认）：**
 
@@ -392,7 +410,7 @@ python -m bill_agent extract-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGE
 **状态：已实现**，代码在 `extract/gate.py`、`extract/reviewer.py`、`extract/numbers.py`。抽取结果通过把关后才能进入标准化。
 
 ```bash
-python -m bill_agent extract <文件或目录>... [--max-retries 2] [--max-review-retries 1] [--no-review] [--out ...]
+python -m bill_agent extract <文件或目录>... [--max-retries 3] [--max-review-retries 1] [--no-review] [--out ...]
 python -m bill_agent review-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGENT" [--out output/review_eval.json]
 ```
 
@@ -400,7 +418,8 @@ python -m bill_agent review-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGEN
 
 | 步骤 | 执行者 | 失败时 |
 |---|---|---|
-| 值能否在原文中找到 | 代码（`convert`） | 带错误重抽，最多 `max_retries` 次，仍失败转待人工 |
+| 值能否在原文中找到 | 代码（`convert`） | 只补问题字段或整份重抽（见 6.3 第 4 步），最多 `max_retries` 次，仍失败转待人工 |
+| 证据不足被清空的字段 | 代码（`convert` 记入 `cleared`） | 审核通过后仍转待人工，理由写明字段和原值 |
 | 数字一致性、签发方不等于接收方 | 代码（`check_numbers`、`convert`） | 同上 |
 | 语义检查 | LLM（`Reviewer`） | 带审核意见重抽，最多 `max_review_retries` 次，仍有问题转待人工 |
 
@@ -413,7 +432,7 @@ python -m bill_agent review-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGEN
 - 与抽取使用同一份规则（`EXTRACTION_RULES`），另加审核专用要求。规则相同也意味着盲区相同：页面抬头印的是收件方时，审核模型和抽取模型会一起判错，这类情况靠代码的“签发方不等于接收方”拦下。
 - issuer / recipient 按语义判断：规则说明 SHIPPER、CONSIGNEE、NOTIFY 是货物各方，只作为判断依据，不直接等同账单双方。DN 的 CONSIGNEE 是 AEBO，与账单双方无关。
 
-**重试上限：** `ReviewGate.run_group` 返回 `passed` 或 `needs_review`，后者附 `reasons` 和每一轮的记录。一组文件最多调用模型：抽取 `(max_retries + 1) × (max_review_retries + 1)` 次，默认 6 次；审核 `(max_review_retries + 1) × 2` 次，默认 4 次。代码核验没通过时不调用审核模型。待人工只是一个状态，暂停、等待确认、继续处理的流程在 LangGraph 阶段实现，届时按状态连接条件分支。
+**重试上限：** `ReviewGate.run_group` 返回 `passed` 或 `needs_review`，后者附 `reasons` 和每一轮的记录。有字段因为证据不足被清空（`cleared`）时，即使审核通过也转待人工：被清空的可能是正确的值。一组文件最多调用模型：抽取 `(max_retries + 1) × (max_review_retries + 1)` 次，默认 8 次（只补问题的轮次输出很短）；审核 `(max_review_retries + 1) × 2` 次，默认 4 次。代码核验没通过时不调用审核模型。待人工只是一个状态，暂停、等待确认、继续处理的流程在 LangGraph 阶段实现，届时按状态连接条件分支。
 
 **评测（`review-eval`）：** golden 不应被误报；故意改坏的字段应被发现。改坏方式只动语义、不破坏算术（漏抽一行除外），例如签发方填成对方、单据号与提单号互换、数量与单价互换、收款方漏填，代码核验查不出来。
 
@@ -435,11 +454,13 @@ python -m bill_agent review-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGEN
 
 **已知问题：**
 
-- ZIM 的 issuer 有 1 次因证据写法不一致（`Co., LLC` / `CO.LLC`）被置空，流程仍判为通过：`cleared` 只记录，不转人工。
-- 要求单据级字段都有证据后，重抽明显变多：CMA 最多用 6 次抽取，邮件每次用满 3 次。
-
+- 值跨多行时（如很长的公司名分两行），`anchored_evidence` 找不到证据（暂缓）。
+- `anchored_evidence` 只看值上面 3 行，不检查标签和值是否在同一列，多栏排版中可能把旁边一栏的标签当成证据；字段含义对不对靠审核把关（暂缓）。
+- 漏抽检查目前只覆盖订舱号。
 - CMA 只有一行费用时，漏抽这一行查不出来；有总计但没有费用行时，代码还不报错。
-- API 报错（如余额不足）会中断整批，已完成的结果不会保存。
+- API 报错（如余额不足）会中断整批，已完成的结果不会保存（暂缓）。
+
+**已解决（2026-11-08）：** 公司名标点差异导致的清空（`CO.LLC` / `Co., LLC`）；被清空的字段不转人工；重抽次数过多。
 
 ### 6.4 标准化
 
@@ -766,7 +787,7 @@ python -m bill_agent run \
 | M0 | 下载样例数据；OCR 接口约定 | `ocr/interface.py` ✅ |
 | M1 | 数据模型；EML / Excel / Word 解析器；Router 递归；PDF / 图片登记为待 OCR | 解析器 + 单元测试 ✅ |
 | M1.5 | 本地 OCR：PDF 文字层 + PaddleOCR PP-StructureV3 | `ocr/local.py` + 单元测试 ✅ |
-| M2 | LLM 结构化抽取 + 证据；质量把关；标准化模块 | 抽取 ✅（golden 78/81 字段一致）；质量把关 ✅；标准化待做 |
+| M2 | LLM 结构化抽取 + 证据；质量把关；标准化模块 | 抽取 ✅（golden 90/90 字段一致）；质量把关 ✅；标准化待做 |
 | M3 | 校验模块；SQLite 账单库；JSON 导入 | |
 | M4 | 4 级匹配；操作判定；字段级 diff；AR/AP 规则 | 核心业务闭环 |
 | M5 | LangGraph 编排；重试与置信度；审计输出 | 端到端可运行 |

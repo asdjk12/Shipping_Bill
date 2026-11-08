@@ -4,7 +4,7 @@
                                [--ocr [--ocr-device cpu|gpu]]
     python -m bill_agent ask <文件或目录>... [-q 问题]... [--model deepseek-v4-pro]
     python -m bill_agent qa-eval <评测集文件或目录>... --samples-dir <样例目录> [--out report.json]
-    python -m bill_agent extract <文件或目录>... [--out extracted.json] [--max-retries 2]
+    python -m bill_agent extract <文件或目录>... [--out extracted.json] [--max-retries 3]
                                  [--max-review-retries 1] [--no-review]
     python -m bill_agent extract-eval --samples-dir <样例目录> [--out report.json]
     python -m bill_agent review-eval --samples-dir <样例目录> [--out report.json]
@@ -151,8 +151,9 @@ def cmd_qa_eval(args: argparse.Namespace) -> int:
 def _print_extraction(r) -> None:
     print(f"\n=== {' + '.join(r.source_paths)}  （第 {r.attempts} 次通过）" if not r.errors
           else f"\n=== {' + '.join(r.source_paths)}  （{r.attempts} 次后仍有 {len(r.errors)} 个问题）")
+    modes = {"full": "整份抽取", "patch": "只补问题"}
     for i, errs in enumerate(r.attempt_errors[:-1], start=1):
-        print(f"  第 {i} 次校验问题（已反馈给模型重试）：")
+        print(f"  第 {i} 次（{modes.get(r.attempt_modes[i - 1], '')}）校验问题，已反馈给模型重试：")
         for e in errs:
             print(f"    - {e}")
     if not r.documents:
@@ -176,7 +177,8 @@ def _print_extraction(r) -> None:
 
 def _extraction_json(r) -> dict:
     return {"source_paths": r.source_paths, "attempts": r.attempts, "errors": r.errors,
-            "attempt_errors": r.attempt_errors, "cleared": r.cleared,
+            "attempt_errors": r.attempt_errors, "attempt_modes": r.attempt_modes, "cleared": r.cleared,
+            "patches": r.patches,
             "documents": [d.model_dump(mode="json") for d in r.documents], "raw_outputs": r.raw_outputs}
 
 
@@ -362,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("extract", parents=[common], help="用 LLM 从文件中抽取结构化单据信息")
     p.add_argument("paths", nargs="+")
     p.add_argument("--model", help="模型名")
-    p.add_argument("--max-retries", type=int, default=2, help="代码核验失败后的最大重抽次数")
+    p.add_argument("--max-retries", type=int, default=3, help="代码核验失败后的最大重抽次数")
     p.add_argument("--max-review-retries", type=int, default=1, help="审核退回后的最大重抽次数")
     p.add_argument("--no-review", action="store_true", help="跳过 LLM 审核，只做抽取和代码核验")
     p.add_argument("--out", help="输出抽取结果 JSON 的路径")
@@ -372,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--samples-dir", required=True, help="题目测试集原件所在目录")
     p.add_argument("--golden-dir", default="tests/fixtures/samples", help="golden 标注与 manifest.json 所在目录")
     p.add_argument("--model", help="模型名")
-    p.add_argument("--max-retries", type=int, default=2)
+    p.add_argument("--max-retries", type=int, default=3)
     p.add_argument("--out", help="输出对比明细 JSON 的路径")
     p.set_defaults(func=cmd_extract_eval)
 
