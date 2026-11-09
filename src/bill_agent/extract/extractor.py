@@ -452,8 +452,11 @@ class Extractor:
         self.max_retries = max_retries
 
     def extract_group(self, group: list[RawDocument], feedback: list[str] | None = None,
-                      previous: dict | None = None) -> ExtractionResult:
+                      previous: dict | None = None, problems: list[Problem] | None = None) -> ExtractionResult:
         """feedback + previous：审核退回时的意见和被退回的输出，整份重新抽取时一直带给模型。
+
+        problems + previous：外部（数据校验 hook）发现的问题。都落在具体字段或价格上时，第一次就只补
+        这些问题；有结构性问题时带着问题整份重新抽取。
 
         第一次整份抽取。之后的问题如果都落在具体字段或价格上（Problem.kind 为 field / price），
         只把这些问题发给模型，让它给出修正并合并进上一次的结果；有结构性问题时整份重新抽取。
@@ -474,6 +477,14 @@ class Extractor:
         result = ExtractionResult(source_paths=[d.source_path for d in group])
         last_full: dict | None = None      # 最近一次能解析的完整输出，补问题时在它上面合并
         patch_next = False
+        if problems and previous is not None:
+            last_full = previous
+            patch_next = all(getattr(p, "kind", "other") in PATCHABLE for p in problems)
+            if patch_next:
+                messages = with_feedback(PATCH_PROMPT, problems, previous)
+            else:
+                feedback = feedback + list(problems)
+                messages = with_feedback(RETRY_PROMPT, feedback, previous)
 
         for attempt in range(1, self.max_retries + 2):
             final = attempt > self.max_retries

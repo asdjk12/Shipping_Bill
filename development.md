@@ -27,7 +27,7 @@
 | 1. 解析 EML 正文及附件 | `parsers/eml.py` + Router 递归 | 6.1 |
 | 2. 调用 OCR 识别 PDF 和图片 | `parsers/pdf_image.py`（登记）+ `ocr/`（文字层 + PaddleOCR） | 6.1、6.2 |
 | 3. 解析 Excel 和 Word 中的费用表格 | `parsers/excel.py`、`parsers/word.py` | 6.1 |
-| 4. 提取单据编号、费用、金额、币种 | `extract/` (LLM 结构化抽取) | 6.3 |
+| 4. 提取单据编号、费用、金额、币种 | `extract/` (LLM 结构化抽取)、`skills/`（skill + 校验 hook） | 6.3 |
 | 5. 区分新增账单与更新账单 | `billing/matcher.py`、`billing/operation.py` | 6.6、6.7 |
 | 6. 结合记账主体判断 AR/AP | `rules/ar_ap.py` | 6.8 |
 | 7. 检测重复账单与数据冲突 | `validate/`、`billing/matcher.py` | 6.5、6.6 |
@@ -422,6 +422,7 @@ python -m bill_agent review-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGEN
 | 证据不足被清空的字段 | 代码（`convert` 记入 `cleared`） | 审核通过后仍转待人工，理由写明字段和原值 |
 | 数字一致性、签发方不等于接收方 | 代码（`check_numbers`、`convert`） | 同上 |
 | 语义检查 | LLM（`Reviewer`） | 带审核意见重抽，最多 `max_review_retries` 次，仍有问题转待人工 |
+| 数据校验（6.5） | 代码（`validate.Validator`），作为 agent hook 在 skill 返回后运行（见 6.3.2） | error 带校验问题只补问题字段，最多 3 次，仍有转待人工；warning 只记入 `GateResult.warnings` |
 
 **审核模型：**
 
@@ -432,7 +433,7 @@ python -m bill_agent review-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGEN
 - 与抽取使用同一份规则（`EXTRACTION_RULES`），另加审核专用要求。规则相同也意味着盲区相同：页面抬头印的是收件方时，审核模型和抽取模型会一起判错，这类情况靠代码的“签发方不等于接收方”拦下。
 - issuer / recipient 按语义判断：规则说明 SHIPPER、CONSIGNEE、NOTIFY 是货物各方，只作为判断依据，不直接等同账单双方。DN 的 CONSIGNEE 是 AEBO，与账单双方无关。
 
-**重试上限：** `ReviewGate.run_group` 返回 `passed` 或 `needs_review`，后者附 `reasons` 和每一轮的记录。有字段因为证据不足被清空（`cleared`）时，即使审核通过也转待人工：被清空的可能是正确的值。一组文件最多调用模型：抽取 `(max_retries + 1) × (max_review_retries + 1)` 次，默认 8 次（只补问题的轮次输出很短）；审核 `(max_review_retries + 1) × 2` 次，默认 4 次。代码核验没通过时不调用审核模型。待人工只是一个状态，暂停、等待确认、继续处理的流程在 LangGraph 阶段实现，届时按状态连接条件分支。
+**重试上限：** `ReviewGate.run_group` 返回 `passed` 或 `needs_review`，后者附 `reasons` 和每一轮的记录。有字段因为证据不足被清空（`cleared`）时，即使审核通过也转待人工：被清空的可能是正确的值。skill 内一次调用最多：抽取 `(max_retries + 1) × (max_review_retries + 1)` 次，默认 8 次（只补问题的轮次输出很短）；审核 `(max_review_retries + 1) × 2` 次，默认 4 次。数据校验 hook 每退回一次，就再调用一次 skill（只处理有问题的组），默认最多 3 次。代码核验没通过时不调用审核模型。待人工只是一个状态，暂停、等待确认、继续处理的流程在 LangGraph 阶段实现，届时按状态连接条件分支。
 
 **评测（`review-eval`）：** golden 不应被误报；故意改坏的字段应被发现。改坏方式只动语义、不破坏算术（漏抽一行除外），例如签发方填成对方、单据号与提单号互换、数量与单价互换、收款方漏填，代码核验查不出来。
 
@@ -461,6 +462,36 @@ python -m bill_agent review-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGEN
 - API 报错（如余额不足）会中断整批，已完成的结果不会保存（暂缓）。
 
 **已解决（2026-11-08）：** 公司名标点差异导致的清空（`CO.LLC` / `Co., LLC`）；被清空的字段不转人工；重抽次数过多。
+
+### 6.3.2 结构化抽取 skill 与数据校验 hook
+
+**状态：已实现**，代码在 `src/bill_agent/skills/`。结构化抽取以后会作为 agent 的 skill 使用，数据校验因此做成 agent 的 hook：只要 agent 调用了这个 skill，校验就在它返回时发生，不依赖调用方记得去校验。
+
+```python
+skill = build_extraction_skill(ReviewGate(extractor, reviewer), load)   # load: 路径 -> 解析 + OCR 结果
+agent = create_agent(model, tools=[skill], middleware=[ValidationHook(max_retries=3)])
+```
+
+| 组件 | 实现 | 说明 |
+|---|---|---|
+| skill `structured_extraction` | `skills/extraction.py`，LangChain `StructuredTool` | 内部是 ReviewGate（抽取 + 代码核验 + LLM 审核）。模型只看到 `paths` 一个参数。返回 `content_and_artifact`：content 是给 agent 的 JSON，artifact 是 `list[GateResult]` |
+| hook `ValidationHook` | `skills/validation_hook.py`，`AgentMiddleware.wrap_tool_call` | 按工具名识别 skill 调用，其他工具直接放行。skill 返回后校验每组 `passed` 的结果 |
+| `run_skill` | `skills/runner.py` | 不经过 agent 模型，按 agent 的方式执行一次 skill（依次经过 middleware）。CLI `extract` 用它，和 agent 走同一套 hook |
+
+**流程：**
+
+1. skill 抽取，返回结果。
+2. hook 校验每组 `passed` 的结果。没有 error 就通过，warning 写进 `GateResult.warnings`。
+3. 有 error 时，把问题和上一次的完整输出交回 skill，只重抽有问题的组。问题按类型决定怎么重抽（`REPAIR_KIND`）：
+   - V1 箱号、V4 匹配键、V5 跨单据冲突是 `field`，只让模型补这些单据级字段；
+   - V3 缺金额是 `price`，只复核价格；
+   - V2 没有费用行是 `other`，带着问题整份重抽。
+4. 重抽结果重新走代码核验和审核，再由 hook 校验。最多重试 3 次（`max_retries`，CLI `--max-validation-retries`），仍有 error 的组转 `needs_review`。
+5. skill 自己判为 `needs_review` 的组不校验，原样返回。每一轮的记录（抽取、审核、校验）都保留在 `GateResult.rounds`。
+
+**重抽要求怎么传给 skill：** 不放在工具参数里。agent 的 ToolNode 不让模型调用携带隐藏参数，模型也不该看到它。hook 在重试前用 `repairing(repair)` 把重抽要求放进 contextvar，skill 执行时读取。
+
+**限制：** 目前只实现了同步的 `wrap_tool_call`，agent 用异步方式（`ainvoke`）调用时还没有 hook。
 
 ### 6.4 标准化
 
@@ -495,6 +526,27 @@ python -m bill_agent review-eval --samples-dir "D:/Leetcode/demo/笔试题AIAGEN
 | 同一费用被重复提取 | 同一批次内按（单据号、标准费用名、金额、币种、箱号）去重，例如邮件正文和附件里重复出现的同一笔费用 | 合并，并在审计中记录 |
 | 证据溯源 | `evidence.quote` 必须能在 RawDocument 原文中模糊匹配到 | 匹配不到的字段置为 null，并降低置信度 |
 | 日期 | 能解析，且在合理范围内 | null |
+
+**抽取结果校验：已实现**（`src/bill_agent/validate/rules.py`，纯代码，不调用 LLM）。作为 agent hook 在结构化抽取 skill 返回后运行（见 6.3.2），覆盖上表中 gate 没有管到的部分；币种 ISO 4217 和日期放到标准化之后校验（已确认）。
+
+| 编号 | 检查 | 级别 |
+|---|---|---|
+| V1 | 箱号符合 ISO 6346（格式 + 校验位）；OCR 混淆字符（O/0、I/1、S/5、B/8 等）替换后能通过校验位时，给出建议值，但不自动改写（抽取值必须照抄原文） | error |
+| V2 | 单据没有费用行（有合计却没有费用行时提示漏抽） | error |
+| V3 | 费用行没有金额 | error |
+| V4 | 单据号、提单号、订舱号、箱号全部为空，无法匹配也无法识别重复 | error |
+| V5 | 同组内同一单据号的多份单据，签发方 / 日期 / 币种不一致 | error |
+| V6 | 同一单据内费用名 + 金额 + 币种都相同的行 | warning |
+| V7 | 同组不同单据间费用名 + 金额 + 币种都相同（邮件正文和附件重复写同一笔） | warning |
+| V8 | 金额为 0 | warning |
+
+error 带校验问题退回 skill，最多 3 次（反馈里要求原文本身如此就照抄，不要自行纠正），重抽结果重新走代码核验和审核；仍有 error 转待人工。warning 不阻止入账，合并去重留给后续批次处理。
+
+```bash
+python -m bill_agent validate <extract --out 的输出 | golden 文件 | 目录>... [--out output/validate.json]
+```
+
+实测：3 份 golden 和 `output/extract_reviewed.json` 中 4 组真实抽取结果，零 issue。
 
 题目要求“OCR 结果不能未经校验直接入账”。因此，**没有通过校验的记录只会输出为 PENDING_REVIEW，不会写入账单库。**
 
@@ -788,7 +840,7 @@ python -m bill_agent run \
 | M1 | 数据模型；EML / Excel / Word 解析器；Router 递归；PDF / 图片登记为待 OCR | 解析器 + 单元测试 ✅ |
 | M1.5 | 本地 OCR：PDF 文字层 + PaddleOCR PP-StructureV3 | `ocr/local.py` + 单元测试 ✅ |
 | M2 | LLM 结构化抽取 + 证据；质量把关；标准化模块 | 抽取 ✅（golden 90/90 字段一致）；质量把关 ✅；标准化待做 |
-| M3 | 校验模块；SQLite 账单库；JSON 导入 | |
+| M3 | 校验模块；SQLite 账单库；JSON 导入 | 抽取结果校验 ✅（V1–V8）；币种 / 日期校验随标准化做 |
 | M4 | 4 级匹配；操作判定；字段级 diff；AR/AP 规则 | 核心业务闭环 |
 | M5 | LangGraph 编排；重试与置信度；审计输出 | 端到端可运行 |
 | M6 | Golden 测试集；README；整理补充思考；打包交付 | zip 或 Git 仓库 |

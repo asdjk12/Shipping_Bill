@@ -1,0 +1,9 @@
+# 四.3 费用名称标准化表（题目给定）。标准名称: [原始名称...]
+# 只改写这里列出的名称：先统一大小写、空格、标点，再精确匹配原始名称或标准名称本身。
+# 表中没有的名称原样照抄，不做模糊匹配，也不交给 LLM 改写。
+Handling Charge: [Handling Fee, H/D Fee]
+Documentation Fee: [Doc Fee]
+Terminal Handling Charge: [THC]
+Trucking Charge: [Trucking Fee]
+Customs Clearance Fee: [Customs Fee]
+Storage Charge: [Storage Fee]

@@ -9,6 +9,9 @@
 4. 超过上限，或审核本身没有完成 -> NEEDS_REVIEW，附上理由
 5. 审核通过，但有字段因为没有证据被清空（ExtractionResult.cleared）-> NEEDS_REVIEW
 
+数据校验不在这里：它是 agent 的 hook（skills/validation_hook.py），在结构化抽取这个 skill 返回后运行，
+有问题时带着问题和上一次的输出（run_group 的 problems / previous）再调用一次 skill，只补问题字段。
+
 一组文件最多的模型调用次数：
     抽取 (max_retries + 1) × (max_review_retries + 1)，审核 (max_review_retries + 1) × 2
 """
@@ -21,8 +24,8 @@ from enum import Enum
 
 from bill_agent.models import ExtractedDocument, RawDocument
 
-from .extractor import ExtractionResult, Extractor, group_documents
-from .reviewer import ReviewIssue, Reviewer, ReviewResult
+from .extractor import ExtractionResult, Extractor, Problem, group_documents
+from .reviewer import Reviewer, ReviewResult
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +41,7 @@ class GateStatus(str, Enum):
 class ReviewRound:
     extraction: ExtractionResult
     review: ReviewResult | None = None       # 代码核验未通过时没有审核
+    validation: object | None = None         # 数据校验结果，由 hook 填写（validate.ValidationResult）
 
 
 @dataclass
@@ -46,6 +50,7 @@ class GateResult:
     status: GateStatus
     documents: list[ExtractedDocument]
     reasons: list[str] = field(default_factory=list)      # NEEDS_REVIEW 的理由，给人工看
+    warnings: list[str] = field(default_factory=list)     # 数据校验的 warning（hook 填写），不阻止入账
     rounds: list[ReviewRound] = field(default_factory=list)
 
 
@@ -55,18 +60,20 @@ class ReviewGate:
         self.reviewer = reviewer
         self.max_review_retries = max_review_retries
 
-    def run_group(self, group: list[RawDocument]) -> GateResult:
+    def run_group(self, group: list[RawDocument], problems: list[Problem] | None = None,
+                  previous: dict | None = None) -> GateResult:
+        """problems + previous：外部（数据校验 hook）发现的问题和对应的上一次输出，第一轮只补这些问题。"""
         paths = [d.source_path for d in group]
         rounds: list[ReviewRound] = []
         feedback: list[str] = []
-        previous: dict | None = None
-        issues: list[ReviewIssue] = []
+        issues = []
 
         def done(status: GateStatus, reasons: list[str]) -> GateResult:
-            return GateResult(paths, status, rounds[-1].extraction.documents, reasons, rounds)
+            return GateResult(paths, status, rounds[-1].extraction.documents, reasons, rounds=rounds)
 
         for _ in range(self.max_review_retries + 1):
-            extraction = self.extractor.extract_group(group, feedback, previous)
+            extraction = self.extractor.extract_group(group, feedback, previous, problems)
+            problems = None
             rounds.append(ReviewRound(extraction))
             if extraction.errors:
                 return done(GateStatus.NEEDS_REVIEW, extraction.errors)
