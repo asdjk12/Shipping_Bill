@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from bill_agent.context import document_context, loose, squash
 from bill_agent.models import ExtractedDocument, RawDocument
+from bill_agent.normalize.payment import PAYMENT_TERMS
 
 from .numbers import check_numbers, numbers_in
 from .prompts import HUMAN_PROMPT, PATCH_PROMPT, RETRY_PROMPT, SYSTEM_PROMPT
@@ -201,8 +202,7 @@ def anchored_evidence(value: str, quote: str, group: list[RawDocument]) -> dict 
 
 # ---------- 付款方式 ----------
 
-PAYMENT_TERMS = {"p", "c", "pp", "cc", "prepaid", "collect", "freightprepaid", "freightcollect",
-                 "预付", "到付", "寄付"}
+# 付款方式写法表与标准化共用一份（normalize.payment），两处口径一致
 _PAYMENT_COLUMN = re.compile(r"(?i)\bP\s*/\s*C\b|\bPP\s*/\s*CC\b|prepaid|collect|pay(ment)?\s*terms?|预付|到付|寄付")
 _BASIS_COLUMN = re.compile(r"(?i)\b(base|basis)\b")
 

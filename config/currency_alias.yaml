@@ -1,7 +1,7 @@
 # 币种别名 -> ISO 4217 三位代码。比对时忽略大小写、空白和点号。
 # 三位代码本身（USD、CNY ...）不用列出，直接查 ISO 白名单。
-# 单独的 "$" 不列入：美元、港币、新加坡元等都写作 $，无法确定，标准化后为 null 并转人工。
-USD: [US$, USD$, U.S.$, US DOLLAR, US DOLLARS, U.S. DOLLARS, 美元, 美金]
+# 单独的 "$" 默认为美元（已确认）。港币、新加坡元等要写成 HK$、S$ 才能识别。
+USD: [$, ＄, US$, USD$, U.S.$, US DOLLAR, US DOLLARS, U.S. DOLLARS, 美元, 美金]
 CNY: [RMB, ¥, ￥, RMB¥, 人民币, 元]
 EUR: [€, EURO, EUROS, 欧元]
 HKD: [HK$, 港币, 港元]

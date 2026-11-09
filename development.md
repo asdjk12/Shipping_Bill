@@ -101,8 +101,8 @@ shipping-bill-agent/
 ├── .env.example
 ├── config/
 │   ├── settings.yaml          # 记账主体、阈值、OCR、LLM 配置
-│   ├── charge_mapping.yaml    # 费用名称标准化表
-│   ├── currency_alias.yaml    # 币种别名 → ISO 4217
+│   ├── charge_mapping.yaml    # 费用名称标准化表 ✅
+│   ├── currency_alias.yaml    # 币种别名 → ISO 4217 ✅
 │   └── entity_alias.yaml      # 记账主体/公司别名
 ├── src/bill_agent/
 │   ├── main.py                # CLI 入口
@@ -495,13 +495,32 @@ agent = create_agent(model, tools=[skill], middleware=[ValidationHook(max_retrie
 
 ### 6.4 标准化
 
-| 对象 | 方法 | 失败处理 |
-|---|---|---|
-| 费用名称 | **只改写题目标准化表中列出的名称**：先把大小写、空格、标点统一，再与表中的原始名称和标准名称做精确匹配，命中则输出标准名称。例如 DN 的 `HANDLING CHARGE` 会输出为 `Handling Charge` | 表中没有的名称**原样照抄**（例如 `4 ADD'L DETENTION FREE TIME CHARGE`、`WHARFAGE`），不做模糊匹配，不交给 LLM 改写，也不因此标 PENDING_REVIEW |
-| 币种 | 查别名表（`US$`/`USD$` → USD，`RMB`/`¥`/`CNY` → CNY），再用 ISO 4217 白名单校验 | 不合法则标 `PENDING_REVIEW` |
-| 付款方式 | `PP`/`P`/`Prepaid`/`Freight Prepaid`/`预付`/`寄付` → PP；`CC`/`C`/`Collect`/`到付` → CC（单字母已确认） | 填 null |
+**状态：已实现**，代码在 `src/bill_agent/normalize/`，标准化表在 `config/`。纯代码，不调用 LLM。
 
-标准化表（题目给定，放在 `config/charge_mapping.yaml`，后续可扩展）：
+```bash
+python -m bill_agent normalize <extract --out 的输出 | golden 文件 | 目录>... [--out output/records.json]
+```
+
+**位置：** 结构化抽取 skill 返回、数据校验 hook 通过之后，把 `ExtractedDocument` 展开为 `ChargeRecord`（每个费用行一条，单据级字段复制到每一行），再进入匹配和 AR/AP。不在抽取层做：抽取值必须照抄原文才能回原文核验；也不在输出层做：匹配、去重要用标准名。
+
+```python
+records = Normalizer().normalize_result(gate_result, texts)    # texts: source_id -> 原文，可省略
+records = Normalizer().normalize_document(doc, source_text)
+```
+
+| 字段 | 方法 | 处理不了时 |
+|---|---|---|
+| 费用名称（`charge.py`） | **只改写标准化表中列出的名称**：标点换成空格、合并空格、转小写后，与表中的原始名称和标准名称精确匹配，命中输出标准名称。DN 的 `HANDLING CHARGE` 输出 `Handling Charge` | 原样照抄（`4 ADD'L DETENTION FREE TIME CHARGE`、`WHARFAGE`、`H/C`、带费用代码的 `OCA17 ...`），不做模糊匹配，不交给 LLM，不转人工 |
+| 币种（`currency.py`） | 行级优先，没有再用单据级；查 `config/currency_alias.yaml`（`US$`/`USD$` → USD，`RMB`/`¥` → CNY），再用 ISO 4217 白名单校验 | null，转人工。单独的 `$` 默认为美元（已确认），邮件的 `$50` 输出 USD，原文 `$` 保留在 `currency_raw`；港币、新加坡元要写成 `HK$`、`S$` |
+| 付款方式（`payment.py`） | `P`/`PP`/`Prepaid`/`Freight Prepaid`/`预付`/`寄付` → PP；`C`/`CC`/`Collect`/`到付` → CC（单字母已确认）。与抽取核验 `payment_term_problem` 共用同一张表。只看费用行本身，邮件的 `FREIGHT PREPAID` 不套用到 H/C | null，不转人工 |
+| 单据类型（`doc_type.py`） | 按关键词依次判断：credit → Credit Note；invoice → Invoice（ZIM 的 `DEBIT INVOICE`）；debit → Debit Note；其余 Other（CMA 的 `GENERAL NOTICE`） | 原文为空时 null |
+| 日期（`dates.py`） | 去掉时间部分。年在前或月份是英文时无歧义；数字月日中有一段大于 12 就以它定顺序；两段都不超过 12 时看同一份原文里其他日期能否确定顺序 | null，转人工（已确认）。不按签发方所在国家或业务常理推测：ZIM 的 `10/03/2025` 原文只有 `10/03`、`10/09` 两个日期，两段都不超过 12，因此转人工 |
+
+**原始值和标准值都保存**：`ChargeRecord` 有 `original_charge_item`、`document_type_raw`、`document_date_raw`、`currency_raw`、`payment_term_raw`。原文写法不同但标准值相同（`10/03/2025` 与 `2025-10-03`）不算 UPDATE 变更，`business_fields` 不含这些原文字段。
+
+**转人工的原因** 写进 `ChargeRecord.review_reasons`，最终输出到 `audit_trail.review_reasons`。把关判为待人工的组也照常标准化，把关的原因带到每条记录。`ChargeRecord` 同时带上 `shipper` / `consignee` / `carrier`，M4 按付款方式推付款方时使用。
+
+标准化表（题目给定，`config/charge_mapping.yaml`，后续可扩展）：
 
 | 原始名称 | 标准名称 |
 |---|---|
@@ -512,7 +531,7 @@ agent = create_agent(model, tools=[skill], middleware=[ValidationHook(max_retrie
 | Customs Fee | Customs Clearance Fee |
 | Storage Fee | Storage Charge |
 
-**原始名称和标准名称都要保存**，见 6.9 节的输出扩展字段。
+**样例结果**（3 份 golden + `output/extract_reviewed.json` 的 4 组，共 13 条记录）：DN 两行 `HANDLING CHARGE` → `Handling Charge`，币种继承单据级 USD，`C` → CC；CMA 为 Other / 2026-10-19 / CC；邮件 `H/C $50` 为 USD；需要人工确认的有 ZIM 的日期（2 条 × 2 份），以及 CMA 一组把关原有的原因。
 
 ### 6.5 数据校验
 
@@ -839,7 +858,7 @@ python -m bill_agent run \
 | M0 | 下载样例数据；OCR 接口约定 | `ocr/interface.py` ✅ |
 | M1 | 数据模型；EML / Excel / Word 解析器；Router 递归；PDF / 图片登记为待 OCR | 解析器 + 单元测试 ✅ |
 | M1.5 | 本地 OCR：PDF 文字层 + PaddleOCR PP-StructureV3 | `ocr/local.py` + 单元测试 ✅ |
-| M2 | LLM 结构化抽取 + 证据；质量把关；标准化模块 | 抽取 ✅（golden 90/90 字段一致）；质量把关 ✅；标准化待做 |
+| M2 | LLM 结构化抽取 + 证据；质量把关；标准化模块 | 抽取 ✅（golden 90/90 字段一致）；质量把关 ✅；标准化 ✅ |
 | M3 | 校验模块；SQLite 账单库；JSON 导入 | 抽取结果校验 ✅（V1–V8）；币种 / 日期校验随标准化做 |
 | M4 | 4 级匹配；操作判定；字段级 diff；AR/AP 规则 | 核心业务闭环 |
 | M5 | LangGraph 编排；重试与置信度；审计输出 | 端到端可运行 |

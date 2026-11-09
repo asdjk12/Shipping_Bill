@@ -7,6 +7,7 @@
     python -m bill_agent extract <文件或目录>... [--out extracted.json] [--max-retries 3]
                                  [--max-review-retries 1] [--max-validation-retries 3] [--no-review]
     python -m bill_agent validate <抽取结果 JSON 或目录>... [--out report.json]
+    python -m bill_agent normalize <抽取结果 JSON 或目录>... [--out records.json]
     python -m bill_agent extract-eval --samples-dir <样例目录> [--out report.json]
     python -m bill_agent review-eval --samples-dir <样例目录> [--out report.json]
 
@@ -16,6 +17,7 @@ ask：解析 + OCR 后基于文件内容向 LLM 提问；不给 -q 时进入交�
 qa-eval：按评测集逐题提问并判分，检验解析 / OCR 结果能否支撑 LLM 正确回答。
 extract：结构化抽取 skill（抽取 + 代码核验 + LLM 审核），调用经过数据校验 hook；超过重试上限标为待人工复核。
 validate：对已保存的抽取结果做数据校验，不调用 LLM。
+normalize：把已保存的抽取结果标准化为费用行记录（ChargeRecord），不调用 LLM。
 extract-eval：抽取 golden 标注对应的样例，逐字段对比（只评测抽取，不经过审核）。
 review-eval：评测审核模型：golden 不应被误报，故意改坏的字段应被发现。
 OCR 结果按文件哈希缓存在 --ocr-cache（默认 data/ocr_cache），同一文件不重复识别。
@@ -301,6 +303,40 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def cmd_normalize(args: argparse.Namespace) -> int:
+    from bill_agent.models import ExtractedDocument
+    from bill_agent.normalize import Normalizer
+
+    files = [f for p in map(Path, args.paths)
+             for f in (sorted(p.glob("*.json")) if p.is_dir() else [p]) if f.name != "manifest.json"]
+    normalizer, records = Normalizer(), []
+    for f in files:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "documents" not in data:      # 单份 ExtractedDocument（golden）
+            groups = [{"documents": [data]}]
+        else:
+            groups = data if isinstance(data, list) else [data]
+        for g in groups:
+            # extract 的输出带 status / reasons；待人工复核的组也标准化，原因带到每条记录
+            upstream = g.get("reasons", []) if g.get("status", "passed") != "passed" else []
+            name = (g.get("source_paths") or [f.name])[0]
+            print(f"\n=== {f.name}: {name}")
+            for d in g["documents"]:
+                for rec in normalizer.normalize_document(ExtractedDocument.model_validate(d), None, upstream):
+                    records.append(rec)
+                    print(f"  [{rec.line_no}] {rec.original_charge_item!r} -> {rec.charge_item!r}  "
+                          f"{rec.amount} {rec.currency} {rec.payment_term and rec.payment_term.value}  "
+                          f"{rec.document_type and rec.document_type.value} {rec.document_date}")
+                    for r in rec.review_reasons:
+                        print(f"      待人工 - {r}")
+    flagged = sum(bool(r.review_reasons) for r in records)
+    print(f"\n{len(records)} 条费用记录，其中 {flagged} 条需要人工确认")
+    if args.out:
+        _write_json(args.out, [r.model_dump(mode="json") for r in records])
+        print(f"明细已写入 {args.out}")
+    return 0
+
+
 def cmd_extract_eval(args: argparse.Namespace) -> int:
     from bill_agent.extract import Extractor
     from bill_agent.extract.compare import compare
@@ -432,6 +468,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("paths", nargs="+", help="extract --out 的输出、golden 标注文件或所在目录")
     p.add_argument("--out", help="输出校验明细 JSON 的路径")
     p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("normalize", help="把已保存的抽取结果标准化为费用行记录（不调用 LLM）")
+    p.add_argument("paths", nargs="+", help="extract --out 的输出、golden 标注文件或所在目录")
+    p.add_argument("--out", help="输出标准化记录 JSON 的路径")
+    p.set_defaults(func=cmd_normalize)
 
     p = sub.add_parser("extract-eval", parents=[common], help="抽取样例并与 golden 标注逐字段对比")
     p.add_argument("--samples-dir", required=True, help="题目测试集原件所在目录")

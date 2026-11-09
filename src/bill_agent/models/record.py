@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import ClassVar
 from uuid import uuid4
 
 from pydantic import Field
@@ -27,12 +28,18 @@ class ChargeRecord(StrictModel):
     document_type_raw: str | None = None
     reference_no: str | None = None
     document_date: date | None = None
+    document_date_raw: str | None = None
 
     # --- 交易双方与收费方向（四.2、四.6）
     issuer: str | None = None
     recipient: str | None = None
     payee: str | None = None
     payer: str | None = None
+
+    # --- 货物三方（M4 按付款方式推付款方：到付取收件人，预付取寄件人）
+    shipper: str | None = None
+    consignee: str | None = None
+    carrier: str | None = None
 
     # --- 匹配键（四.5）
     bl_nos: list[str] = Field(default_factory=list)
@@ -50,7 +57,9 @@ class ChargeRecord(StrictModel):
     unit_price: Amount | None = None
     amount: Amount | None = None
     currency: str | None = Field(default=None, pattern=CURRENCY_PATTERN)
+    currency_raw: str | None = Field(default=None, description="币种原文；费用行没有时为单据级币种原文")
     payment_term: PaymentTerm | None = None
+    payment_term_raw: str | None = None
 
     # --- 财务属性（四.6）
     accounting_entity: str | None = None
@@ -59,10 +68,15 @@ class ChargeRecord(StrictModel):
     # --- 溯源（二.9）
     source_ids: list[str] = Field(default_factory=list)
     evidence: dict[str, Evidence] = Field(default_factory=dict)
+    review_reasons: list[str] = Field(default_factory=list, description="需要人工确认的原因（把关、标准化）")
+
+    # 原文写法不同但标准值相同（如 10/03/2025 与 2025-10-03）不算变更
+    _NON_BUSINESS: ClassVar[frozenset[str]] = frozenset({
+        "source_ids", "evidence", "review_reasons", "document_date_raw", "currency_raw", "payment_term_raw"})
 
     def business_fields(self) -> dict:
-        """参与 UPDATE diff 的业务字段（不含溯源信息）。"""
-        return self.model_dump(exclude={"source_ids", "evidence"})
+        """参与 UPDATE diff 的业务字段（不含溯源信息和原文写法）。"""
+        return self.model_dump(exclude=self._NON_BUSINESS)
 
 
 class BillRecord(ChargeRecord):
@@ -73,4 +87,4 @@ class BillRecord(ChargeRecord):
     updated_at: datetime = Field(default_factory=datetime.now)
 
     def business_fields(self) -> dict:
-        return self.model_dump(exclude={"source_ids", "evidence", "record_id", "version", "updated_at"})
+        return self.model_dump(exclude=self._NON_BUSINESS | {"record_id", "version", "updated_at"})
