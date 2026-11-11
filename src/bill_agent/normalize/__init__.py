@@ -6,7 +6,7 @@
 | 币种     | 行级优先、否则单据级；config/currency_alias.yaml + ISO 4217 | null，转人工      |
 | 付款方式 | P/PP/Prepaid/预付/寄付 -> PP；C/CC/Collect/到付 -> CC        | null              |
 | 单据类型 | 关键词：credit / invoice / debit，其余 Other                 | 原文为空时 null   |
-| 日期     | 去掉时间；数字月日按大于 12 的一段或同单据其他日期判断顺序    | null，转人工      |
+| 日期     | 去掉时间；年在前为年/月/日，年在后为月/日/年（按 4 位年份定位） | null，转人工      |
 """
 
 from .charge import ChargeNormalizer, charge_key

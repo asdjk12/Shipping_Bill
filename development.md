@@ -51,7 +51,7 @@
 | PDF 文字层 | `pdfplumber` | 系统生成的 PDF 直接读文字层，不走 OCR |
 | OCR | PaddleOCR 3.x（PP-StructureV3：版面 + PP-OCRv5 + 表格结构） | 本地运行；可选依赖 `.[ocr]` |
 | 本地数据库 | SQLite（`sqlite3` 或 SQLModel） | 轻量，支持索引和事务 |
-| 模糊匹配 | `rapidfuzz` | 用于公司名（记账主体别名）匹配 |
+| 模糊匹配 | 标准库 `difflib` | 用于公司名（记账主体别名）匹配，只用来发现“很像但不相同”的名字并转人工 |
 | 测试 | `pytest` | |
 | 配置 | `pydantic-settings` + `.env` / YAML | |
 
@@ -103,13 +103,13 @@ shipping-bill-agent/
 │   ├── settings.yaml          # 记账主体、阈值、OCR、LLM 配置
 │   ├── charge_mapping.yaml    # 费用名称标准化表 ✅
 │   ├── currency_alias.yaml    # 币种别名 → ISO 4217 ✅
-│   └── entity_alias.yaml      # 记账主体/公司别名
+│   └── entity_alias.yaml      # 记账主体别名 ✅
 ├── src/bill_agent/
 │   ├── main.py                # CLI 入口
 │   ├── models/                # Pydantic 数据模型
 │   │   ├── raw.py             # RawDocument
 │   │   ├── extraction.py      # ExtractedDocument / ExtractedCharge
-│   │   ├── bill.py            # BillRecord（数据库记录）
+│   │   ├── record.py          # ChargeRecord / BillRecord（数据库记录） ✅
 │   │   └── output.py          # 标准输出格式
 │   ├── parsers/
 │   │   ├── detect.py          # 文件头识别类型
@@ -144,11 +144,12 @@ shipping-bill-agent/
 │   │   ├── rules.py
 │   │   └── evidence.py        # 原文溯源校验
 │   ├── billing/
-│   │   ├── repository.py      # SQLite 读写
-│   │   ├── matcher.py         # 4 级匹配
-│   │   └── operation.py       # CREATE/UPDATE/NO_CHANGE/PENDING_REVIEW + diff
+│   │   ├── repository.py      # SQLite 读写 ✅
+│   │   ├── bill_json.py       # 已有账单 JSON 导入映射 ✅
+│   │   ├── matcher.py         # 4 级匹配 ✅
+│   │   └── operation.py       # CREATE/UPDATE/NO_CHANGE/PENDING_REVIEW + diff ✅
 │   ├── rules/
-│   │   └── ar_ap.py
+│   │   └── ar_ap.py           # AR/AP 判断 ✅
 │   ├── graph/
 │   │   ├── state.py
 │   │   ├── nodes.py
@@ -504,8 +505,8 @@ python -m bill_agent normalize <extract --out 的输出 | golden 文件 | 目录
 **位置：** 结构化抽取 skill 返回、数据校验 hook 通过之后，把 `ExtractedDocument` 展开为 `ChargeRecord`（每个费用行一条，单据级字段复制到每一行），再进入匹配和 AR/AP。不在抽取层做：抽取值必须照抄原文才能回原文核验；也不在输出层做：匹配、去重要用标准名。
 
 ```python
-records = Normalizer().normalize_result(gate_result, texts)    # texts: source_id -> 原文，可省略
-records = Normalizer().normalize_document(doc, source_text)
+records = Normalizer().normalize_result(gate_result)
+records = Normalizer().normalize_document(doc)
 ```
 
 | 字段 | 方法 | 处理不了时 |
@@ -514,7 +515,7 @@ records = Normalizer().normalize_document(doc, source_text)
 | 币种（`currency.py`） | 行级优先，没有再用单据级；查 `config/currency_alias.yaml`（`US$`/`USD$` → USD，`RMB`/`¥` → CNY），再用 ISO 4217 白名单校验 | null，转人工。单独的 `$` 默认为美元（已确认），邮件的 `$50` 输出 USD，原文 `$` 保留在 `currency_raw`；港币、新加坡元要写成 `HK$`、`S$` |
 | 付款方式（`payment.py`） | `P`/`PP`/`Prepaid`/`Freight Prepaid`/`预付`/`寄付` → PP；`C`/`CC`/`Collect`/`到付` → CC（单字母已确认）。与抽取核验 `payment_term_problem` 共用同一张表。只看费用行本身，邮件的 `FREIGHT PREPAID` 不套用到 H/C | null，不转人工 |
 | 单据类型（`doc_type.py`） | 按关键词依次判断：credit → Credit Note；invoice → Invoice（ZIM 的 `DEBIT INVOICE`）；debit → Debit Note；其余 Other（CMA 的 `GENERAL NOTICE`） | 原文为空时 null |
-| 日期（`dates.py`） | 去掉时间部分。年在前或月份是英文时无歧义；数字月日中有一段大于 12 就以它定顺序；两段都不超过 12 时看同一份原文里其他日期能否确定顺序 | null，转人工（已确认）。不按签发方所在国家或业务常理推测：ZIM 的 `10/03/2025` 原文只有 `10/03`、`10/09` 两个日期，两段都不超过 12，因此转人工 |
+| 日期（`dates.py`） | 去掉时间部分。月份是英文时无歧义。数字日期只有两种默认格式，按 4 位年份的位置区分（已确认）：**年在前按年/月/日，年在后按月/日/年**（DN 的 `10-24-2026`、CMA 的 `10/19/2026`、ZIM 的 `10/03/2025` → 2025-10-03）。例外：年在后、第一段大于 12（如 `24/10/2026`）时按月/日读不成日期，只能是日/月 | 年份不是 4 位（如 `10/03/25`）或不是有效日期：null，转人工 |
 
 **原始值和标准值都保存**：`ChargeRecord` 有 `original_charge_item`、`document_type_raw`、`document_date_raw`、`currency_raw`、`payment_term_raw`。原文写法不同但标准值相同（`10/03/2025` 与 `2025-10-03`）不算 UPDATE 变更，`business_fields` 不含这些原文字段。
 
@@ -531,7 +532,7 @@ records = Normalizer().normalize_document(doc, source_text)
 | Customs Fee | Customs Clearance Fee |
 | Storage Fee | Storage Charge |
 
-**样例结果**（3 份 golden + `output/extract_reviewed.json` 的 4 组，共 13 条记录）：DN 两行 `HANDLING CHARGE` → `Handling Charge`，币种继承单据级 USD，`C` → CC；CMA 为 Other / 2026-10-19 / CC；邮件 `H/C $50` 为 USD；需要人工确认的有 ZIM 的日期（2 条 × 2 份），以及 CMA 一组把关原有的原因。
+**样例结果**（3 份 golden + `output/extract_reviewed.json` 的 4 组，共 13 条记录）：DN 两行 `HANDLING CHARGE` → `Handling Charge`，币种继承单据级 USD，`C` → CC；CMA 为 Other / 2026-10-19 / CC；邮件 `H/C $50` 为 USD；需要人工确认的只有 CMA 一组把关原有的原因（ZIM 日期按年份位置默认月/日/年后不再转人工）。
 
 ### 6.5 数据校验
 
@@ -571,43 +572,42 @@ python -m bill_agent validate <extract --out 的输出 | golden 文件 | 目录>
 
 ### 6.6 账单库与匹配
 
-**记录粒度为费用行**，一张单据有 N 个费用就对应 N 条记录。
+**账单库状态：已实现**，代码在 `src/bill_agent/billing/`（`repository.py` 读写，`bill_json.py` 导入映射），CLI `db-import`。匹配（`matcher.py`）与操作判定（`operation.py`）**已实现**，CLI `apply`。
+
+**记录粒度为费用行**，一张单据有 N 个费用就对应 N 条记录，一行即一个 `BillRecord`（`models/record.py`，即 `ChargeRecord` + `record_id` / `version` / `updated_at`）。用标准库 `sqlite3`，不用 ORM；Pydantic 模型就是结构定义。
+
+| 设计点 | 做法 |
+|---|---|
+| 主表列 | 与 `BillRecord` 的标量字段一一对应（含 payee/payer、shipper/consignee/carrier、各 `*_raw`、`line_no`），测试保证列与模型字段一致 |
+| 提单号、箱号是列表 | 拆到子表 `bill_bl`、`bill_container`，在子表上建索引，匹配规则 2、4 才能走索引 |
+| 金额 | 存规范化后的十进制文本（`65.00`、`65` 都存成 `65`），不用 REAL，避免浮点误差，且能直接按值查 |
+| 日期 | ISO 文本 `YYYY-MM-DD` |
+| 费用名 | 另存一列 `charge_key`（转小写、标点换空格、合并空格），匹配规则 1–3 和改账指令都按它比较：表外费用名照抄原文，`DETENTION CHARGE` 与 `Detention Charge` 是同一个费用。只忽略写法差异，**不做同义词替换**：同义只认标准化表里 test.pdf 明确要求的（已确认）；结构版本 2 起有这一列，旧库打开时自动迁移补齐 |
+| evidence / review_reasons / posting_reasoning / source_ids | JSON 文本，只用于溯源，不参与查询 |
+| 结构版本 | `PRAGMA user_version`，启动时按版本逐级迁移 |
+| 事务 | `transaction()` 一个批次一个事务，可嵌套，只有最外层提交或回滚 |
+| 更新 | `update(record_id, changes, expected_version, source_id)`：只写 `changes` 里的字段，值经模型校验；新旧值相同不写库；否则旧记录快照写 `bill_history`，version + 1；版本对不上抛 `VersionConflict`（乐观锁） |
 
 ```sql
-CREATE TABLE bill_records (
-  record_id        TEXT PRIMARY KEY,   -- UUID
-  reference_no     TEXT,
-  document_type    TEXT,
-  document_date    TEXT,
-  issuer           TEXT,
-  recipient        TEXT,
-  bl_no            TEXT,
-  booking_no       TEXT,
-  container_no     TEXT,
-  charge_item      TEXT,               -- 标准名
-  charge_item_raw  TEXT,
-  quantity         REAL,
-  unit_price       REAL,
-  amount           REAL,
-  currency         TEXT,
-  payment_term     TEXT,
-  accounting_entity TEXT,
-  posting_type     TEXT,
-  version          INTEGER DEFAULT 1,
-  updated_at       TEXT,
-  source_ids       TEXT                -- JSON 数组
-);
-CREATE INDEX idx_ref_charge   ON bill_records(reference_no, charge_item);
-CREATE INDEX idx_bl           ON bill_records(bl_no, charge_item, currency);
-CREATE INDEX idx_booking      ON bill_records(booking_no, charge_item, currency);
-CREATE INDEX idx_container    ON bill_records(container_no, document_date);
-
-CREATE TABLE bill_history (           -- 每次 UPDATE 的旧值快照，用于回溯
-  record_id TEXT, version INTEGER, snapshot TEXT, changed_at TEXT, source_id TEXT
-);
+CREATE TABLE bill_records (record_id TEXT PRIMARY KEY, ...BillRecord 标量字段..., 
+                           version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
+CREATE TABLE bill_bl        (record_id TEXT REFERENCES bill_records ON DELETE CASCADE, bl_no TEXT,
+                             PRIMARY KEY (record_id, bl_no));
+CREATE TABLE bill_container (record_id TEXT REFERENCES bill_records ON DELETE CASCADE, container_no TEXT,
+                             PRIMARY KEY (record_id, container_no));
+CREATE TABLE bill_history   (record_id TEXT, version INTEGER, snapshot TEXT, changed_fields TEXT,
+                             changed_at TEXT, source_id TEXT, PRIMARY KEY (record_id, version));
+CREATE INDEX idx_ref_charge ON bill_records(reference_no, charge_key);
+CREATE INDEX idx_booking    ON bill_records(booking_no, charge_key, currency);
+CREATE INDEX idx_bl         ON bill_bl(bl_no);
+CREATE INDEX idx_container  ON bill_container(container_no);
 ```
 
-启动时把已有账单 JSON 导入数据库（upsert）。
+`repository` 只按匹配键查候选（`find_by_ref_charge` / `find_by_bl` / `find_by_booking` / `find_by_container`，任一键为 null 返回空，即跳过该级）；优先级、冲突判断、交易双方别名归一化放在 matcher。
+
+**账单库的来源**（已确认）：“已有账单 JSON”由我们自己产生，不是外部样例。正常流程是 `apply` 把每批抽取结果写进账单库；后续批次抽到同一笔交易时，匹配到已有记录并以 UPDATE 合并，不新建。
+
+**导入账单 JSON**（`db-import`）：用于导入我们导出的或手工补充的账单，支持两种形状：6.9 的标准输出格式（本程序的输出可再导入），以及键名等于 `BillRecord` 字段的平铺格式（另接受 `bl_no`、`container_no`、`charge_item_raw` 等别名）。不认识的键丢弃并提示；值不合法的记录记为错误、不影响其他记录。按 `record_id` upsert，没有 `record_id` 时用"文件内容哈希 + 序号"生成固定 id，同一文件重复导入结果为无变化。导入的数据目前不经过标准化（费用名、币种按原值入库）。
 
 **匹配规则：4 级优先级，命中即停止，但会记录所有规则的命中情况。**
 
@@ -618,10 +618,12 @@ CREATE TABLE bill_history (           -- 每次 UPDATE 的旧值快照，用于�
 | 3 | 订舱号 + 费用名称 + 币种 |
 | 4 | 箱号 + 交易双方 + 日期 + 金额 |
 
-- 匹配键中有任何一个为 null，就跳过该级规则；
-- 某一级命中**多条**记录，视为冲突，标 PENDING_REVIEW；
-- 不同级别的规则命中了**不同的记录**，也视为冲突，标 PENDING_REVIEW；
-- 交易双方比较前先经过公司别名表归一化。
+- 匹配键中有任何一个为 null，就跳过该级规则；提单号 / 箱号有多个时任一个命中即可；
+- 某一级命中多条时先消歧：**同一份单据里行号不同的是该单据的另一行费用，排除**（样例 DN 两行 `HANDLING CHARGE`）；再优先行号相同、金额相同的。消歧后仍有**多条**，视为冲突，标 PENDING_REVIEW；
+- 低一级规则唯一命中了**另一条费用名称相同的记录**，视为冲突。命中费用名不同的记录只记录、不算冲突：规则 4 不含费用名，同一箱、同一天、同金额的不同费用很常见；
+- 同一批次里两条新费用行匹配到同一条已有记录（含本批次刚新建的），视为冲突；
+- 交易双方比较前先经过公司别名表（`config/entity_alias.yaml`）归一化。
+- 每条结果的 `ai_reasoning` 里列出四级规则各自的命中情况。
 
 ### 6.7 操作判定与字段级 Diff
 
@@ -637,9 +639,19 @@ CREATE TABLE bill_history (           -- 每次 UPDATE 的旧值快照，用于�
 1. 如果邮件正文或单据中有明确的改账指令（`change_instructions`），只更新指令涉及的字段；
 2. 否则，视为单据本身就是修订后的版本（如 Revised DN）。只有同时满足以下三个条件的字段才会更新：输入中**非 null**、有**原文证据**、而且与原值**不同**；
 3. null 字段和缺少证据的字段一律保留原值；
-4. 每个被修改的字段都记录“旧值 → 新值 + 证据”，写入 `ai_reasoning`，旧值快照写入 `bill_history`。
+4. 每个被修改的字段都记录“旧值 → 新值 + 证据”，写入 `ai_reasoning` 和 `changed_fields`，旧值快照写入 `bill_history`。
+
+**实现细节**（`billing/operation.py` 的 `BillProcessor`，一个批次一个事务）：
+- 提单号、箱号取**并集**，不删已有值（分批到达的单据可能各只写了一部分）；
+- 原文写法字段（`*_raw`、原始费用名）跟随对应标准字段一起改，单独不同不算变更；行号只在单据号变化时跟着改；
+- `accounting_entity` / `posting_type` 不直接比较，而是在合并后的记录上重新跑 AR/AP；结果不确定时转人工；
+- “有原文证据”这一条默认不再检查（`require_evidence=False`）：抽取阶段已做数字代码核验和 LLM 审核，且费用行通常没有逐字段证据；需要时可打开；
+- 改账指令按“单据号 + 费用名（忽略大小写和标点）”定位目标，目标不唯一、字段不支持或新值解析失败时转人工；目标不在本单据费用行里的（如邮件正文要求改另一张单据）单独输出一条 UPDATE；
+- PENDING_REVIEW 不写库，CREATE / UPDATE / NO_CHANGE 之外的状态都由人工处理后再跑。
 
 ### 6.8 AR/AP 判断
+
+**状态：已实现**，代码在 `src/bill_agent/rules/ar_ap.py`，别名表在 `config/entity_alias.yaml`。纯代码，不调用 LLM。CLI `normalize` 标准化后接着判断 AR/AP（`--entity`，默认 PAT），判断过程写进 `ChargeRecord.posting_reasoning`（不参与 UPDATE diff）。
 
 核心原则：**LLM 只抽取签发方、接收方、单据类型和金额，AR/AP 由规则函数计算。**
 
@@ -649,12 +661,18 @@ PAT 的别名表（**已确认**）：`PAT`、`Pilot Aiship Tech co., Ltd.`、`�
 
 **第 2 步：确定资金方向。**
 
-**优先使用单据上明确写出的收款方**（payee，如 “REMIT TO”、“BALANCE DUE TO”、“payments must be issued to”）。三份样例里都有这一信息，而 CMA CGM 的 General Notice 不属于 DN/CN/Invoice，只能靠它判断方向。单据上没有写明收款方时，再按单据类型推断：
+收款方和付款方分开确定（**已确认**），都是先用单据上写明的值：
 
-| 单据类型 | 收款方 | 付款方 |
+**收款方（payee）：** 优先使用单据上明确写出的收款方（如 “REMIT TO”、“BALANCE DUE TO”、“payments must be issued to”）。三份样例里都有这一信息，而 CMA CGM 的 General Notice 不属于 DN/CN/Invoice，只能靠它判断方向。没有写明时，再按单据类型推断（见下表）。
+
+**付款方（payer）：** 单据上写明了就用（如 ZIM 的 payer、邮件的 `SHA pay TAR`）。**没有写明时按付款方式判断：到付（CC）取 consignee，寄付（PP）取 shipper。** 付款方式缺失，或者对应的 shipper / consignee 为空时，才按单据类型推断（见下表）。**不用签发方去补付款方**：签发方往往只是印在抬头的公司（如 PAT、NEPTUNE 这类航运公司），不一定是账单一方。付款方式取费用行的值（抽取只在费用行上有付款方式），所以同一张单据里不同费用行的付款方可以不同。
+
+| 单据类型 | 收款方 | 付款方（兜底） |
 |---|---|---|
 | Debit Note / Invoice | 签发方 | 接收方 |
 | Credit Note | 接收方 | 签发方 |
+
+兜底推出的付款方与收款方是同一家公司时，视为付款方未知。
 
 如果金额为负，或者文本中含有 refund / rebate / 退款等语义，方向取反。
 
@@ -665,34 +683,36 @@ PAT 的别名表（**已确认**）：`PAT`、`Pilot Aiship Tech co., Ltd.`、`�
 | 钱流入 PAT（PAT 是收款方） | `AR` |
 | 钱从 PAT 流出（PAT 是付款方） | `AP` |
 | PAT 不是交易任何一方 | `null`（JSON 的 null，不是字符串）。**不因此标 PENDING_REVIEW**，其他字段照常输出 |
-| 别名匹配分数介于阈值附近，无法确定是不是 PAT | `null` + `PENDING_REVIEW`，并在 `review_reasons` 中写明 |
+| 无法确定是不是 PAT：去掉大小写、空白、标点后与别名不同，但相似度 ≥ 0.85（如 `Pilot Aiship Technology Co., Ltd.`），或包含完整的别名词（如 `PAT LOGISTICS LLC`） | `null` + `PENDING_REVIEW`，并在 `review_reasons` 中写明 |
+| 收款方和付款方都是 PAT | `null` + `PENDING_REVIEW` |
 
 **样例的期望结果：**
 
 | 样例 | 收款方 ← 付款方 | 结果 |
 |---|---|---|
-| DN DC-108478 | Neptune ← AEBO（到付，收件人付款） | `null`（PAT 不是寄件人、收件人或送货人） |
-| ZIM Invoice ORFR1618731 | ZIM ← All America Forwarding | `null` |
-| CMA CGM Notice（PDF示例账单1） | CMA CGM ← Neptune | `null` |
-| Pre-alert 邮件（H/C $50） | TAR ← SHA | `null`（SHA 和 TAR 都不是 PAT） |
-
-**待调整（M4 实现时处理）：** 下方 `decide_posting_type` 在只有收款方时，用签发方推出付款方。PAT 只是印在抬头时，这会把 DN 算成 AP，与上表的 `null` 不符。实现时应改为：付款方没有写明时按付款方式判断，到付取 consignee，寄付取 shipper。
+| DN DC-108478 | Neptune（写明）← AEBO（到付，取 consignee） | `null`（PAT 不是寄件人、收件人或送货人） |
+| ZIM Invoice ORFR1618731 | ZIM（写明）← USIAHALLAM（写明） | `null` |
+| CMA CGM Notice（PDF示例账单1） | CMA CGM（写明）← Neptune（到付，取 consignee） | `null` |
+| Pre-alert 邮件（H/C $50） | TAR ← SHA（都写明） | `null`（SHA 和 TAR 都不是 PAT） |
 
 **第 4 步：用付款方式做交叉校验（辅助信号）。** PP 费用通常由起运港一方收取，CC 费用通常由目的港一方收取。如果主体的角色已知（Origin 或 Destination），而 PP/CC 推出的结论与第 3 步矛盾，就降低置信度并在审计中说明。这一步不推翻主判据。
 
-**题目样例验证**：Destination Agent 向 Origin Agent 签发 Debit Note，记账主体为 Origin Agent。按第 2 步，付款方是接收方，也就是 Origin Agent，所以 posting_type 为 **AP**，与题目样例一致。
+**题目样例验证**：Destination Agent 向 Origin Agent 签发 Debit Note，记账主体为 Origin Agent。样例没有写明收付款方，也没有 shipper / consignee，按第 2 步的兜底，付款方是接收方 Origin Agent，所以 posting_type 为 **AP**，与题目样例一致。
 
 ```python
 def decide_posting_type(doc_type, issuer, recipient, entity, amount, refund_hint,
-                        stated_payee=None, stated_payer=None):
-    if stated_payee or stated_payer:                   # 单据明确写出的收付款方优先（如 "SHA pay TAR"）
-        payee = stated_payee or (issuer if not same_entity(stated_payer, issuer) else recipient)
-        payer = stated_payer or (recipient if same_entity(stated_payee, issuer) else issuer)
-    else:
-        payee, payer = (issuer, recipient) if doc_type in {"Debit Note", "Invoice"} \
-                       else (recipient, issuer) if doc_type == "Credit Note" else (None, None)
-    if payee is None:
-        return None, "单据类型无法确定收费方向"
+                        stated_payee=None, stated_payer=None,
+                        payment_term=None, shipper=None, consignee=None):
+    by_type = {"Debit Note": (issuer, recipient), "Invoice": (issuer, recipient),
+               "Credit Note": (recipient, issuer)}.get(doc_type, (None, None))
+    payee = stated_payee or by_type[0]                 # 收款方：写明 > 单据类型
+    payer = (stated_payer                              # 付款方：写明 > 付款方式 > 单据类型兜底
+             or (consignee if payment_term == "CC" else shipper if payment_term == "PP" else None)
+             or by_type[1])                            # 不用签发方补付款方
+    if payer is not None and same_entity(payer, payee):
+        payer = None                                   # 兜底推出的付款方就是收款方，视为未知
+    if payee is None and payer is None:
+        return None, "无法确定收付款方"
     if (amount is not None and amount < 0) or refund_hint:
         payee, payer = payer, payee
     if same_entity(entity, payee):  return "AR", f"{entity} 为收款方，钱流入 {entity}"
@@ -834,7 +854,7 @@ llm:
   temperature: 0
 thresholds:
   confidence_review: 0.8
-  fuzzy_entity: 88
+  fuzzy_entity: 0.85        # difflib 相似度
   amount_tolerance: 0.01
   max_extract_retries: 2
 ```
@@ -859,8 +879,8 @@ python -m bill_agent run \
 | M1 | 数据模型；EML / Excel / Word 解析器；Router 递归；PDF / 图片登记为待 OCR | 解析器 + 单元测试 ✅ |
 | M1.5 | 本地 OCR：PDF 文字层 + PaddleOCR PP-StructureV3 | `ocr/local.py` + 单元测试 ✅ |
 | M2 | LLM 结构化抽取 + 证据；质量把关；标准化模块 | 抽取 ✅（golden 90/90 字段一致）；质量把关 ✅；标准化 ✅ |
-| M3 | 校验模块；SQLite 账单库；JSON 导入 | 抽取结果校验 ✅（V1–V8）；币种 / 日期校验随标准化做 |
-| M4 | 4 级匹配；操作判定；字段级 diff；AR/AP 规则 | 核心业务闭环 |
+| M3 | 校验模块；SQLite 账单库；JSON 导入 | 抽取结果校验 ✅（V1–V8）；币种 / 日期校验随标准化做；SQLite 账单库 + JSON 导入 ✅ |
+| M4 | 4 级匹配；操作判定；字段级 diff；AR/AP 规则 | AR/AP ✅（样例全部为 null，与 6.8 期望一致）；匹配、操作判定、diff ✅（CLI `apply`） |
 | M5 | LangGraph 编排；重试与置信度；审计输出 | 端到端可运行 |
 | M6 | Golden 测试集；README；整理补充思考；打包交付 | zip 或 Git 仓库 |
 

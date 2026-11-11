@@ -36,7 +36,7 @@ class ChargeRecord(StrictModel):
     payee: str | None = None
     payer: str | None = None
 
-    # --- 货物三方（M4 按付款方式推付款方：到付取收件人，预付取寄件人）
+    # --- 货物三方（AR/AP 按付款方式推付款方：到付取 consignee，寄付取 shipper，见 rules/ar_ap.py）
     shipper: str | None = None
     consignee: str | None = None
     carrier: str | None = None
@@ -64,6 +64,7 @@ class ChargeRecord(StrictModel):
     # --- 财务属性（四.6）
     accounting_entity: str | None = None
     posting_type: PostingType | None = None
+    posting_reasoning: list[str] = Field(default_factory=list, description="AR/AP 的判断过程（6.8）")
 
     # --- 溯源（二.9）
     source_ids: list[str] = Field(default_factory=list)
@@ -72,7 +73,8 @@ class ChargeRecord(StrictModel):
 
     # 原文写法不同但标准值相同（如 10/03/2025 与 2025-10-03）不算变更
     _NON_BUSINESS: ClassVar[frozenset[str]] = frozenset({
-        "source_ids", "evidence", "review_reasons", "document_date_raw", "currency_raw", "payment_term_raw"})
+        "source_ids", "evidence", "review_reasons", "document_date_raw", "currency_raw", "payment_term_raw",
+        "posting_reasoning"})
 
     def business_fields(self) -> dict:
         """参与 UPDATE diff 的业务字段（不含溯源信息和原文写法）。"""

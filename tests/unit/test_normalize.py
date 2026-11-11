@@ -109,7 +109,7 @@ def test_document_type(raw, expected):
 # ---------- 日期 ----------
 
 @pytest.mark.parametrize("raw, expected", [
-    ("10-24-2026", date(2026, 10, 24)),             # DN：第二段大于 12，月/日
+    ("10-24-2026", date(2026, 10, 24)),             # DN：年在后，默认月/日
     ("10/19/2026 05:58 PM", date(2026, 10, 19)),    # CMA：去掉时间
     ("24/10/2026", date(2026, 10, 24)),             # 第一段大于 12，日/月
     ("2026-10-30", date(2026, 10, 30)),
@@ -121,20 +121,13 @@ def test_date(raw, expected):
     assert normalize_date(raw) == (expected, None)
 
 
-def test_date_ambiguous_without_context():
-    """ZIM 的 10/03/2025：两段都不超过 12，原文里也只有 10/03、10/09，不推测。"""
-    value, problem = normalize_date("10/03/2025", "INVOICE DATE 10/03/2025 DUE 10/09/2025")
-    assert value is None and "月/日" in problem
+def test_date_year_last_defaults_to_month_day():
+    """年在后默认月/日/年（ZIM 的 10/03/2025 -> 2025-10-03），不转人工。"""
+    assert normalize_date("10/03/2025") == (date(2025, 10, 3), None)
+    assert normalize_date("03.10.2025") == (date(2025, 3, 10), None)
 
 
-def test_date_order_from_context():
-    assert normalize_date("10/03/2025", "ETA 10/25/2025") == (date(2025, 10, 3), None)
-    assert normalize_date("10/03/2025", "ETA 25/10/2025") == (date(2025, 3, 10), None)
-    # 原文中的日期互相矛盾时不采信
-    assert normalize_date("10/03/2025", "10/25/2025 25/10/2025")[0] is None
-
-
-@pytest.mark.parametrize("raw", ["13/13/2026", "02/30/2026", "N/A"])
+@pytest.mark.parametrize("raw", ["13/13/2026", "02/30/2026", "10/03/25", "N/A"])
 def test_date_invalid(raw):
     value, problem = normalize_date(raw)
     assert value is None and problem
@@ -158,11 +151,11 @@ def test_dn_golden():
     assert all(not r.review_reasons for r in records)
 
 
-def test_zim_golden_date_needs_review():
+def test_zim_golden():
     records = Normalizer().normalize_document(golden("INV_ZIM_ORFR1618731.expected_extraction.json"))
     assert [r.document_type for r in records] == [DocumentType.INVOICE] * 2
-    assert all(r.document_date is None and r.document_date_raw == "10/03/2025" for r in records)
-    assert all(any("document_date" in x for x in r.review_reasons) for r in records)
+    assert all(r.document_date == date(2025, 10, 3) and r.document_date_raw == "10/03/2025" for r in records)
+    assert all(not r.review_reasons for r in records)
     assert all(r.payment_term is None for r in records)
 
 

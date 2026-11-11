@@ -8,6 +8,8 @@
                                  [--max-review-retries 1] [--max-validation-retries 3] [--no-review]
     python -m bill_agent validate <抽取结果 JSON 或目录>... [--out report.json]
     python -m bill_agent normalize <抽取结果 JSON 或目录>... [--out records.json]
+    python -m bill_agent db-import <账单 JSON 或目录>... [--db data/bills.db]
+    python -m bill_agent apply <抽取结果 JSON 或目录>... [--db data/bills.db] [--entity PAT] [--out result.json]
     python -m bill_agent extract-eval --samples-dir <样例目录> [--out report.json]
     python -m bill_agent review-eval --samples-dir <样例目录> [--out report.json]
 
@@ -18,6 +20,8 @@ qa-eval：按评测集逐题提问并判分，检验解析 / OCR 结果能否支
 extract：结构化抽取 skill（抽取 + 代码核验 + LLM 审核），调用经过数据校验 hook；超过重试上限标为待人工复核。
 validate：对已保存的抽取结果做数据校验，不调用 LLM。
 normalize：把已保存的抽取结果标准化为费用行记录（ChargeRecord），不调用 LLM。
+db-import：把已有账单 JSON 导入 SQLite 账单库（按 record_id upsert，重复导入结果不变）。
+apply：抽取结果 -> 标准化 -> AR/AP -> 4 级匹配 -> 操作判定，CREATE / UPDATE 写入账单库，输出标准格式 JSON。
 extract-eval：抽取 golden 标注对应的样例，逐字段对比（只评测抽取，不经过审核）。
 review-eval：评测审核模型：golden 不应被误报，故意改坏的字段应被发现。
 OCR 结果按文件哈希缓存在 --ocr-cache（默认 data/ocr_cache），同一文件不重复识别。
@@ -306,10 +310,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
 def cmd_normalize(args: argparse.Namespace) -> int:
     from bill_agent.models import ExtractedDocument
     from bill_agent.normalize import Normalizer
+    from bill_agent.rules import EntityMatcher, apply_posting
 
     files = [f for p in map(Path, args.paths)
              for f in (sorted(p.glob("*.json")) if p.is_dir() else [p]) if f.name != "manifest.json"]
     normalizer, records = Normalizer(), []
+    entity = EntityMatcher.load(args.entity)
     for f in files:
         data = json.loads(f.read_text(encoding="utf-8"))
         if isinstance(data, dict) and "documents" not in data:      # 单份 ExtractedDocument（golden）
@@ -322,11 +328,15 @@ def cmd_normalize(args: argparse.Namespace) -> int:
             name = (g.get("source_paths") or [f.name])[0]
             print(f"\n=== {f.name}: {name}")
             for d in g["documents"]:
-                for rec in normalizer.normalize_document(ExtractedDocument.model_validate(d), None, upstream):
+                recs = normalizer.normalize_document(ExtractedDocument.model_validate(d), upstream)
+                for rec in apply_posting(recs, entity):
                     records.append(rec)
                     print(f"  [{rec.line_no}] {rec.original_charge_item!r} -> {rec.charge_item!r}  "
                           f"{rec.amount} {rec.currency} {rec.payment_term and rec.payment_term.value}  "
-                          f"{rec.document_type and rec.document_type.value} {rec.document_date}")
+                          f"{rec.document_type and rec.document_type.value} {rec.document_date}  "
+                          f"{rec.accounting_entity}:{rec.posting_type and rec.posting_type.value}")
+                    for r in rec.posting_reasoning:
+                        print(f"      AR/AP - {r}")
                     for r in rec.review_reasons:
                         print(f"      待人工 - {r}")
     flagged = sum(bool(r.review_reasons) for r in records)
@@ -334,6 +344,74 @@ def cmd_normalize(args: argparse.Namespace) -> int:
     if args.out:
         _write_json(args.out, [r.model_dump(mode="json") for r in records])
         print(f"明细已写入 {args.out}")
+    return 0
+
+
+def cmd_db_import(args: argparse.Namespace) -> int:
+    from bill_agent.billing import BillRepository
+
+    result = build_default_router(RouterConfig(blob_dir=args.blob_dir)).route_paths(args.paths)
+    for s in result.skipped:
+        print(f"[skip ] {s.source_path}  -- {s.reason}")
+    if result.documents:
+        print(f"忽略 {len(result.documents)} 份非账单 JSON 文件")
+    failed = 0
+    with BillRepository(args.db) as repo:
+        for b in result.bill_jsons:
+            r = repo.import_bills(b)
+            failed += bool(r.errors)
+            print(f"\n=== {r.source_path}: 新增 {len(r.created)} | 更新 {len(r.updated)} | "
+                  f"无变化 {len(r.unchanged)} | 错误 {len(r.errors)}")
+            for w in r.warnings:
+                print(f"  提示 - {w}")
+            for e in r.errors:
+                print(f"  ! {e}")
+        print(f"\n账单库 {args.db} 共 {repo.count()} 条记录")
+    return 1 if failed else 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    from bill_agent.billing import BillProcessor, BillRepository, Matcher, PartyNormalizer
+    from bill_agent.models import ExtractedDocument, to_json
+    from bill_agent.normalize import Normalizer
+    from bill_agent.rules import EntityMatcher
+
+    files = [f for p in map(Path, args.paths)
+             for f in (sorted(p.glob("*.json")) if p.is_dir() else [p]) if f.name != "manifest.json"]
+    normalizer = Normalizer()
+    items = []
+    for f in files:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        groups = [{"documents": [data]}] if isinstance(data, dict) and "documents" not in data else (
+            data if isinstance(data, list) else [data])
+        for g in groups:
+            upstream = g.get("reasons", []) if g.get("status", "passed") != "passed" else []
+            for d in g["documents"]:
+                doc = ExtractedDocument.model_validate(d)
+                items.append((doc, normalizer.normalize_document(doc, upstream)))
+
+    with BillRepository(args.db) as repo:
+        processor = BillProcessor(repo, Matcher(repo, PartyNormalizer.load()), EntityMatcher.load(args.entity),
+                                  normalizer)
+        results = processor.process_batch(items)
+        for r in results:
+            rec = r.record
+            print(f"\n[{r.operation.value:14}] {rec.reference_no or '-'} 第 {rec.line_no or '-'} 行 "
+                  f"{rec.original_charge_item!r}  {rec.amount} {rec.currency}  -> {r.record_id or '-'}")
+            for line in r.reasoning:
+                print(f"    {line}")
+            for line in r.review_reasons:
+                print(f"    待人工 - {line}")
+        counts: dict[str, int] = {}
+        for r in results:
+            counts[r.operation.value] = counts.get(r.operation.value, 0) + 1
+        print(f"\n{len(results)} 条：" + " | ".join(f"{k} {v}" for k, v in counts.items())
+              + f"；账单库 {args.db} 共 {repo.count()} 条记录")
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(to_json([r.to_output() for r in results], strict=args.strict_schema),
+                                  encoding="utf-8")
+        print(f"输出已写入 {args.out}")
     return 0
 
 
@@ -472,7 +550,22 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("normalize", help="把已保存的抽取结果标准化为费用行记录（不调用 LLM）")
     p.add_argument("paths", nargs="+", help="extract --out 的输出、golden 标注文件或所在目录")
     p.add_argument("--out", help="输出标准化记录 JSON 的路径")
+    p.add_argument("--entity", default="PAT", help="记账主体（config/entity_alias.yaml 中的名称或别名）")
     p.set_defaults(func=cmd_normalize)
+
+    p = sub.add_parser("db-import", help="把已有账单 JSON 导入 SQLite 账单库")
+    p.add_argument("paths", nargs="+", help="账单 JSON 文件或所在目录")
+    p.add_argument("--db", default="data/bills.db", help="账单库路径")
+    p.add_argument("--blob-dir", default="data/blobs", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_db_import)
+
+    p = sub.add_parser("apply", help="把抽取结果标准化、匹配账单库并判定 CREATE/UPDATE/NO_CHANGE/PENDING_REVIEW")
+    p.add_argument("paths", nargs="+", help="extract --out 的输出、golden 标注文件或所在目录（一次调用为一个批次）")
+    p.add_argument("--db", default="data/bills.db", help="账单库路径")
+    p.add_argument("--entity", default="PAT", help="记账主体")
+    p.add_argument("--out", help="输出标准格式 JSON（6.9）的路径")
+    p.add_argument("--strict-schema", action="store_true", help="只输出题目样例中的核心字段")
+    p.set_defaults(func=cmd_apply)
 
     p = sub.add_parser("extract-eval", parents=[common], help="抽取样例并与 golden 标注逐字段对比")
     p.add_argument("--samples-dir", required=True, help="题目测试集原件所在目录")

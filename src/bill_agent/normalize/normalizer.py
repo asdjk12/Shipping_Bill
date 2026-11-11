@@ -1,7 +1,7 @@
 """把通过把关的 ExtractedDocument 展开为标准化后的 ChargeRecord（每个费用行一条，四.4）。
 
-    records = Normalizer().normalize_document(doc, source_text)   # 一份单据
-    records = Normalizer().normalize_result(gate_result, texts)   # skill 返回的一组文件
+    records = Normalizer().normalize_document(doc)            # 一份单据
+    records = Normalizer().normalize_result(gate_result)      # skill 返回的一组文件
 
 只做确定性转换，不调用 LLM。原文和标准值都保留（*_raw 与标准字段）。处理不了的值置为 null，
 原因写进 ChargeRecord.review_reasons；费用名称不在标准化表中不算问题，原样照抄。
@@ -26,11 +26,11 @@ class Normalizer:
         self.charge = ChargeNormalizer(config_dir)
         self.currency = CurrencyNormalizer(config_dir)
 
-    def normalize_document(self, doc: ExtractedDocument, source_text: str | None = None,
+    def normalize_document(self, doc: ExtractedDocument,
                            review_reasons: list[str] | None = None) -> list[ChargeRecord]:
-        """source_text：单据原文，用来判断数字日期的月日顺序；review_reasons：上游（把关）给出的原因。"""
+        """review_reasons：上游（把关）给出的原因，带到每条记录。"""
         upstream = list(review_reasons or [])
-        doc_date, date_problem = normalize_date(doc.document_date_raw, source_text)
+        doc_date, date_problem = normalize_date(doc.document_date_raw)
         doc_level = dict(
             document_type=normalize_document_type(doc.document_type_raw),
             document_type_raw=doc.document_type_raw,
@@ -66,12 +66,7 @@ class Normalizer:
             source_ids=source_ids, evidence=evidence, review_reasons=reasons,
         )
 
-    def normalize_result(self, result, texts: dict[str, str] | None = None) -> list[ChargeRecord]:
-        """result：extract.gate.GateResult。待人工复核的组也标准化，把关原因带到每条记录。
-
-        texts：source_id -> 原文（RawDocument.text），没有时日期只按自身判断月日顺序。
-        """
+    def normalize_result(self, result) -> list[ChargeRecord]:
+        """result：extract.gate.GateResult。待人工复核的组也标准化，把关原因带到每条记录。"""
         upstream = list(result.reasons) if result.status.value != "passed" else []
-        texts = texts or {}
-        return [rec for doc in result.documents
-                for rec in self.normalize_document(doc, texts.get(doc.source_id), upstream)]
+        return [rec for doc in result.documents for rec in self.normalize_document(doc, upstream)]
