@@ -151,13 +151,12 @@ shipping-bill-agent/
 │   ├── rules/
 │   │   └── ar_ap.py           # AR/AP 判断 ✅
 │   ├── graph/
-│   │   ├── state.py
-│   │   ├── nodes.py
-│   │   └── build.py           # LangGraph 组装
+│   │   ├── state.py           # AgentState ✅
+│   │   ├── nodes.py           # 节点 ✅
+│   │   ├── build.py           # LangGraph 组装 + trace ✅
+│   │   └── deps.py            # 生产依赖（LLM / OCR）✅
 │   └── harness/
-│       ├── retry.py
-│       ├── confidence.py
-│       └── tracing.py
+│       └── confidence.py      # 置信度 ✅
 ├── data/
 │   ├── samples/               # 题目样例（百度网盘下载）
 │   └── bills.db
@@ -764,47 +763,70 @@ python -m bill_agent qa-eval tests/fixtures/qa --samples-dir "D:/Leetcode/demo/�
 - **证据核验**：代码把每条 evidence 放回上下文中查找（忽略空白和大小写），找不到即视为编造。这与 M2 抽取的证据校验是同一套思路。
 - **评测集**（`tests/fixtures/qa/*.qa.json`）：4 个样例共 35 题。`expect` 要求答案包含全部片段（比较时忽略大小写、空白和千分位逗号）；`expect_found: false` 是文件中没有答案的陷阱题，用来检验模型会不会编造。证据核验不通过的题也判为失败。
 
-## 7. Agent 编排（LangGraph）
+## 7. Agent 编排（LangGraph）：已实现
 
-```python
-class AgentState(TypedDict):
-    inputs: list[str]
-    raw_docs: list[RawDocument]
-    extracted: list[ExtractedDocument]
-    records: list[CandidateRecord]   # 标准化后的费用行
-    errors: list[ValidationIssue]
-    retry_count: int
-    outputs: list[OutputRecord]
-    trace: list[str]
+代码在 `src/bill_agent/graph/`：`state.py`（状态）、`nodes.py`（节点）、`build.py`（组装 + trace）、`deps.py`（生产依赖）。
+
+```bash
+python -m bill_agent run <文件或目录>... [--db data/bills.db] [--entity PAT] [--out result.json] [--no-hitl]
+python -m bill_agent resume <run_id> [--decisions decisions.json]
 ```
 
 ```mermaid
 stateDiagram-v2
     [*] --> parse
-    parse --> ocr: 有 PDF/图片
-    parse --> extract: 无需 OCR
-    ocr --> extract
+    parse --> ocr: 有待 OCR 的文档
+    parse --> import_bills: 无需 OCR
+    ocr --> import_bills
+    import_bills --> extract
     extract --> normalize
-    normalize --> validate
-    validate --> extract: 可修复错误 且 retry < N
-    validate --> match
-    match --> ar_ap
-    ar_ap --> decide
-    decide --> persist
-    persist --> output
+    normalize --> score
+    score --> reconcile
+    reconcile --> human_review: 有待人工 且 未超过复核轮数
+    human_review --> reconcile
+    reconcile --> output
     output --> [*]
 ```
 
 | 节点 | 实现 | 是否调用 LLM |
 |---|---|---|
-| parse | Router | 否 |
-| ocr | `run_ocr` + `LocalOCR`（只处理 pending_ocr / ocr_failed） | 否（PaddleOCR） |
-| extract | 结构化抽取（把校验错误作为反馈带入下一次重试） | **是** |
-| normalize | 查表（只改写标准化表中的名称） | 否 |
-| validate | 规则校验 + 证据溯源 | 否 |
-| match / ar_ap / decide | 确定性规则 | 否 |
-| persist | 只写入 CREATE/UPDATE，单批次一个事务 | 否 |
-| output | 序列化 + 最终 schema 校验 | 否 |
+| parse | `Router.route_paths` | 否 |
+| ocr | `run_ocr` + `CachedOCR(LocalOCR)`（只处理 pending_ocr / ocr_failed） | 否（PaddleOCR） |
+| import_bills | 输入里的已有账单 JSON 先入库（按 record_id upsert，幂等） | 否 |
+| extract | 结构化抽取 skill，经过数据校验 hook（`run_skill`） | **是** |
+| normalize | `Normalizer`（币种、日期校验在这里完成） | 否 |
+| score | 置信度打分（`harness/confidence.py`），低于阈值追加待人工原因 | 否 |
+| reconcile | AR/AP + 4 级匹配 + 操作判定 + 写库（`BillProcessor`，一个批次一个事务） | 否 |
+| human_review | `interrupt()` 暂停，等人工处理 | 否 |
+| output | 最终 schema 校验，写 JSON | 否 |
+
+**和最初设计的差别：**
+
+- **没有 validate → extract 回边**：抽取的重试已全部在 skill 内部（ReviewGate 的代码核验 / LLM 审核，ValidationHook 的 V1–V8），图上再加一层会让重试套两层。
+- **没有独立的 validate 节点**：币种 ISO 4217、日期的校验在 Normalizer 里，问题写进 review_reasons。
+- **match / ar_ap / decide / persist 合成 reconcile**：BillProcessor 在同一事务里边判定边写库，同批次后面的行要能匹配到前面刚 CREATE 的记录（`Matcher.claim`）。拆开就要另做"先算计划、再提交"两阶段。
+- **新增 import_bills、score、human_review。**
+
+**样例端到端（2026-11-12）**：4 个样例 7 条费用行，首次全部 CREATE，抽取约 45 秒、5.4 万 token；同一批文件再跑一次，账单已有的都判为 NO_CHANGE。第二次跑时按旧的覆盖率算法（按 evidence 键名）有 2 条 ZIM 费用行低于阈值，暂停等人工，`resume` approve 后为 NO_CHANGE，没有重新抽取。改成按摘录内容判断后，用两次的抽取结果重算：DN、CMA、Pre-alert 都是 1.00；ZIM 一次 0.96（OCR 置信度），另一次模型只摘录了数字、名称和币种没有依据，0.84（0.96 × 0.875）。
+
+**状态**（`AgentState`）只放可序列化的 Pydantic 模型和基本类型，SQLite checkpointer（`langgraph-checkpoint-sqlite`）能保存，进程退出后也能恢复。反序列化只允许本项目状态里的类型（`build.state_types()` 自动收集），LangGraph 对未登记类型默认只警告、将来会拦截。每个字段只由一个节点写；`trace` 用 reducer 追加。`GateResult` 的每一轮抽取 / 审核 / 校验记录体积大，写到审计目录的 `extraction.json`，状态里只留轮数。
+
+**节点接口**：`node(state, deps) -> (update, summary)`，不引用 LangGraph 类型（human_review 的 `interrupt` 除外）。外部能力从 `NodeDeps` 注入，抽取是 `extract_fn(paths, docs) -> list[GateResult]` 这个 Callable，节点里不出现 LangChain 的 Tool。`build.py` 统一包装：计时、用 `get_usage_metadata_callback` 统计 token、生成 `TraceEvent` 追加到状态并写 `trace.jsonl`。以后换自研 harness 时只换 Runtime（build.py）和 State（checkpointer），节点不动。
+
+**人工复核（HITL）**：reconcile 把 PENDING_REVIEW 的输出做成 ticket，human_review 用 `interrupt` 暂停。CLI 的 `run` 停下后写出 `tickets.json` 和待填写的 `decisions.json`，`resume` 读回后继续。每个 ticket 的处理：
+
+| action | 处理 |
+|---|---|
+| approve | 清空待人工原因，按原记录再走一次匹配和判定（AR/AP 首轮已判，不再重判） |
+| edit | 先把 `changes` 写进记录（改了交易方字段时重判 AR/AP），再同 approve；值不合法则不入账，下一轮再问 |
+| reject | 不写库，保留 PENDING_REVIEW，原因追加"人工驳回" |
+
+- 再走一次后仍是 PENDING_REVIEW 的（如匹配冲突），生成下一轮 ticket，最多 `max_review_rounds`（默认 3）轮，之后直接输出。
+- 无法自动定位的改账指令只能 reject，approve / edit 不生效。
+- 恢复时只重跑 reconcile 之后的部分，不会重新抽取。
+- `--no-hitl` 时不暂停，待人工直接输出 PENDING_REVIEW。
+
+**审计目录**（默认 `output/runs/<run_id>/`）：`run.json`（运行参数，resume 用）、`extraction.json`（每组每一轮的抽取、审核、校验记录）、`trace.jsonl`（每个节点的耗时、摘要、token）、`tickets.json` / `decisions.json`。输出 JSON 的 `audit_trail` 带 `confidence`、`source_files`，`ai_reasoning` 里有置信度的三项因子。
 
 **为什么不用自由的 ReAct Agent**：财务数据要求结果可复现、可审计。流程固定的状态机能把 LLM 的不确定性限制在“理解文本”这一个环节里。同时，节点内部仍然可以以 LangChain Tool 的形式封装（如 `ocr_tool`、`lookup_bill_tool`），方便以后扩展成对话式 Agent，例如回答“这张单为什么被判为 AP”。
 
@@ -822,7 +844,10 @@ stateDiagram-v2
    confidence = OCR置信度 × 证据覆盖率 × Π(校验惩罚系数)
    ```
 
-   低于阈值（默认 0.8）的记录标 PENDING_REVIEW，并写明原因。
+   低于阈值（默认 0.8）的记录标 PENDING_REVIEW，并写明原因。已实现（`harness/confidence.py`）：
+   - OCR 置信度取记录来源文档里的最小值，文字层 / Excel / Word 按 1.0；
+   - 证据覆盖率 = 单据级和本费用行里有值的字段中，有原文依据的比例。不按 evidence 键名算：模型常用一条整行摘录同时支撑名称、单价、币种，却只挂在 amount 下，所以值能在同一范围（本行 / 单据级）的任一摘录里找到就算（数字按数值比较）。列表字段（提单号、箱号）有一个值有依据即可，因为一个字段只能挂一条摘录；
+   - 惩罚：数据校验每条 warning × 0.95，抽取 + 审核每多一轮 × 0.95（系数是暂定值，待用更多样例校准）。
 6. **幂等与缓存**：以文件哈希缓存 OCR 和 LLM 结果；同一文件重复处理时结果完全一致，且判定为 NO_CHANGE。
 7. **事务与回滚**：每批次一个数据库事务，`bill_history` 保存版本快照。
 8. **可观测性**：用 LangSmith 或本地 JSONL 记录每个节点的输入、输出、耗时和 token 用量。
@@ -881,7 +906,7 @@ python -m bill_agent run \
 | M2 | LLM 结构化抽取 + 证据；质量把关；标准化模块 | 抽取 ✅（golden 90/90 字段一致）；质量把关 ✅；标准化 ✅ |
 | M3 | 校验模块；SQLite 账单库；JSON 导入 | 抽取结果校验 ✅（V1–V8）；币种 / 日期校验随标准化做；SQLite 账单库 + JSON 导入 ✅ |
 | M4 | 4 级匹配；操作判定；字段级 diff；AR/AP 规则 | AR/AP ✅（样例全部为 null，与 6.8 期望一致）；匹配、操作判定、diff ✅（CLI `apply`） |
-| M5 | LangGraph 编排；重试与置信度；审计输出 | 端到端可运行 |
+| M5 | LangGraph 编排；重试与置信度；审计输出 | 编排 ✅（CLI `run` / `resume`，人工复核暂停与恢复）；置信度 ✅；审计输出 ✅ |
 | M6 | Golden 测试集；README；整理补充思考；打包交付 | zip 或 Git 仓库 |
 
 ---

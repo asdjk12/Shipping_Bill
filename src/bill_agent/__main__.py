@@ -10,6 +10,8 @@
     python -m bill_agent normalize <抽取结果 JSON 或目录>... [--out records.json]
     python -m bill_agent db-import <账单 JSON 或目录>... [--db data/bills.db]
     python -m bill_agent apply <抽取结果 JSON 或目录>... [--db data/bills.db] [--entity PAT] [--out result.json]
+    python -m bill_agent run <文件或目录>... [--db data/bills.db] [--entity PAT] [--out result.json] [--no-hitl]
+    python -m bill_agent resume <run_id> [--decisions decisions.json]
     python -m bill_agent extract-eval --samples-dir <样例目录> [--out report.json]
     python -m bill_agent review-eval --samples-dir <样例目录> [--out report.json]
 
@@ -22,6 +24,9 @@ validate：对已保存的抽取结果做数据校验，不调用 LLM。
 normalize：把已保存的抽取结果标准化为费用行记录（ChargeRecord），不调用 LLM。
 db-import：把已有账单 JSON 导入 SQLite 账单库（按 record_id upsert，重复导入结果不变）。
 apply：抽取结果 -> 标准化 -> AR/AP -> 4 级匹配 -> 操作判定，CREATE / UPDATE 写入账单库，输出标准格式 JSON。
+run：端到端编排（LangGraph）：解析 -> OCR -> 抽取 -> 标准化 -> 置信度 -> 入账。有待人工复核时暂停，
+     写出 output/runs/<run_id>/tickets.json 和待填写的 decisions.json。
+resume：读入人工处理结果，从暂停处继续（不会重新抽取）。
 extract-eval：抽取 golden 标注对应的样例，逐字段对比（只评测抽取，不经过审核）。
 review-eval：评测审核模型：golden 不应被误报，故意改坏的字段应被发现。
 OCR 结果按文件哈希缓存在 --ocr-cache（默认 data/ocr_cache），同一文件不重复识别。
@@ -34,6 +39,9 @@ import json
 import sys
 from pathlib import Path
 
+from bill_agent.extract.serialize import extraction_json as _extraction_json
+from bill_agent.extract.serialize import gate_json as _gate_json
+from bill_agent.extract.serialize import validation_json as _validation_json
 from bill_agent.parsers import RouterConfig, build_default_router
 
 
@@ -183,13 +191,6 @@ def _print_extraction(r) -> None:
         print(f"  ! {e}")
 
 
-def _extraction_json(r) -> dict:
-    return {"source_paths": r.source_paths, "attempts": r.attempts, "errors": r.errors,
-            "attempt_errors": r.attempt_errors, "attempt_modes": r.attempt_modes, "cleared": r.cleared,
-            "patches": r.patches,
-            "documents": [d.model_dump(mode="json") for d in r.documents], "raw_outputs": r.raw_outputs}
-
-
 def _print_review(review) -> None:
     if review.incomplete:
         print(f"  审核未完成：{review.incomplete}")
@@ -221,24 +222,6 @@ def _print_validation(validation) -> None:
         print("  数据校验通过")
     for i in validation.issues:
         print(f"  校验{'问题' if i.severity.value == 'error' else '提示'} - {i}")
-
-
-def _validation_json(validation) -> dict:
-    return {"issues": [{"code": i.code, "severity": i.severity.value, "doc": i.doc, "field": i.field,
-                        "message": i.message} for i in validation.issues]}
-
-
-def _review_json(review) -> dict:
-    return {"issues": [vars(i) for i in review.issues], "dismissed": [vars(i) for i in review.dismissed],
-            "incomplete": review.incomplete, "attempts": review.attempts, "raw_outputs": review.raw_outputs}
-
-
-def _gate_json(g) -> dict:
-    return {"source_paths": g.source_paths, "status": g.status.value, "reasons": g.reasons,
-            "warnings": g.warnings, "documents": [d.model_dump(mode="json") for d in g.documents],
-            "rounds": [{"extraction": _extraction_json(r.extraction),
-                        "review": r.review and _review_json(r.review),
-                        "validation": r.validation and _validation_json(r.validation)} for r in g.rounds]}
 
 
 def _write_json(path: str, data) -> None:
@@ -504,6 +487,87 @@ def cmd_review_eval(args: argparse.Namespace) -> int:
     return 0 if false_alarms == 0 and found == total else 1
 
 
+_RUN_KEYS = ("db", "entity", "model", "blob_dir", "ocr", "ocr_device", "ocr_cache", "out", "no_hitl",
+             "confidence_threshold", "max_retries", "max_review_retries", "max_validation_retries")
+
+
+def _run_graph(run: dict, payload, checkpoint: str) -> int:
+    """按 run.json 的配置建图并执行；停在人工复核时写出 tickets.json 和待填写的 decisions.json。"""
+    import sqlite3
+
+    from bill_agent.graph import build_graph
+    from bill_agent.graph.build import sqlite_checkpointer
+    from bill_agent.graph.deps import make_deps
+
+    audit = Path(run["audit_dir"])
+    deps = make_deps(db_path=run["db"], entity=run["entity"] or None, model=run["model"], blob_dir=run["blob_dir"],
+                     ocr=run["ocr"], ocr_device=run["ocr_device"], ocr_cache=run["ocr_cache"] or None,
+                     audit_dir=str(audit), out_path=run["out"], hitl=not run["no_hitl"],
+                     confidence_threshold=run["confidence_threshold"], max_retries=run["max_retries"],
+                     max_review_retries=run["max_review_retries"],
+                     max_validation_retries=run["max_validation_retries"])
+    Path(checkpoint).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(checkpoint, check_same_thread=False)
+    try:
+        graph = build_graph(deps, checkpointer=sqlite_checkpointer(conn))
+        config = {"configurable": {"thread_id": run["run_id"]}}
+        result = graph.invoke(payload, config)
+    finally:
+        conn.close()
+
+    for ev in result.get("trace", [])[-12:]:
+        tok = f" | {ev.tokens} tokens" if ev.tokens else ""
+        print(f"[{ev.node:12}] {ev.duration_ms:>7} ms{tok}  {ev.summary}")
+    if "__interrupt__" in result:
+        tickets = result["__interrupt__"][0].value["tickets"]
+        _write_json(str(audit / "tickets.json"), tickets)
+        template = audit / "decisions.json"
+        _write_json(str(template), [{"ticket_id": t["ticket_id"], "action": "", "changes": {}, "note": None}
+                                    for t in tickets])
+        print(f"\n{len(tickets)} 条待人工复核：")
+        for t in tickets:
+            rec = t["record"]
+            print(f"  {t['ticket_id']}: {rec.get('reference_no') or '-'} 第 {rec.get('line_no') or '-'} 行 "
+                  f"{rec.get('original_charge_item')!r} {rec.get('amount')} {rec.get('currency')}")
+            for r in t["reasons"]:
+                print(f"      - {r}")
+        print(f"\n明细见 {audit / 'tickets.json'}。在 {template} 中为每条填写 action（approve / edit / reject），"
+              f"然后运行：\n  python -m bill_agent resume {run['run_id']}")
+        return 2
+    print(f"\n完成：审计记录在 {audit}" + (f"，结果写入 {run['out']}" if run["out"] else ""))
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    from datetime import datetime
+    from uuid import uuid4
+
+    run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:6]}"
+    audit = Path(args.audit_root) / run_id
+    run = {"run_id": run_id, "audit_dir": str(audit), "inputs": args.paths,
+           **{k: getattr(args, k) for k in _RUN_KEYS}}
+    _write_json(str(audit / "run.json"), run)
+    print(f"run_id: {run_id}\n")
+    return _run_graph(run, {"inputs": args.paths, "run_id": run_id}, args.checkpoint)
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    from langgraph.types import Command
+
+    from bill_agent.graph import ReviewDecision
+
+    audit = Path(args.audit_root) / args.run_id
+    run = json.loads((audit / "run.json").read_text(encoding="utf-8"))
+    path = Path(args.decisions) if args.decisions else audit / "decisions.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        decisions = [ReviewDecision.model_validate(d).model_dump(mode="json") for d in raw]
+    except Exception as e:
+        print(f"{path} 格式不对（action 只能是 approve / edit / reject）：{e}", file=sys.stderr)
+        return 1
+    return _run_graph(run, Command(resume=decisions), args.checkpoint)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bill_agent")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -566,6 +630,31 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", help="输出标准格式 JSON（6.9）的路径")
     p.add_argument("--strict-schema", action="store_true", help="只输出题目样例中的核心字段")
     p.set_defaults(func=cmd_apply)
+
+    run_common = argparse.ArgumentParser(add_help=False)
+    run_common.add_argument("--audit-root", default="output/runs", help="审计记录根目录，每次运行一个子目录")
+    run_common.add_argument("--checkpoint", default="data/checkpoints.db", help="LangGraph checkpoint 数据库")
+
+    p = sub.add_parser("run", parents=[common, run_common],
+                       help="端到端处理：解析 -> OCR -> 抽取 -> 标准化 -> 置信度 -> 入账，待人工时暂停")
+    p.add_argument("paths", nargs="+")
+    p.add_argument("--db", default="data/bills.db", help="账单库路径")
+    p.add_argument("--entity", default="PAT", help="记账主体；传空字符串则不判断 AR/AP")
+    p.add_argument("--model", help="模型名")
+    p.add_argument("--no-ocr", dest="ocr", action="store_false", help="不做 OCR（扫描件和图片不抽取）")
+    p.add_argument("--out", help="输出标准格式 JSON 的路径")
+    p.add_argument("--no-hitl", action="store_true", help="待人工不暂停，直接输出 PENDING_REVIEW")
+    p.add_argument("--confidence-threshold", type=float, default=0.8)
+    p.add_argument("--max-retries", type=int, default=3)
+    p.add_argument("--max-review-retries", type=int, default=1)
+    p.add_argument("--max-validation-retries", type=int, default=3)
+    p.add_argument("--run-id", help="默认按时间生成")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("resume", parents=[run_common], help="填写人工复核结果后继续 run")
+    p.add_argument("run_id")
+    p.add_argument("--decisions", help="人工处理 JSON，默认为该次运行审计目录下的 decisions.json")
+    p.set_defaults(func=cmd_resume)
 
     p = sub.add_parser("extract-eval", parents=[common], help="抽取样例并与 golden 标注逐字段对比")
     p.add_argument("--samples-dir", required=True, help="题目测试集原件所在目录")

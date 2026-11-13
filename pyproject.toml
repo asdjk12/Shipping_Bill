@@ -13,6 +13,8 @@ dependencies = [
     "langchain>=1.4",          # create_agent + middleware（数据校验 hook）
     "langchain-core>=1.0",
     "langchain-deepseek>=1.0",   # LLM：DeepSeek（需要 DEEPSEEK_API_KEY）
+    "langgraph>=1.0",            # 编排：状态机 + interrupt（人工复核）
+    "langgraph-checkpoint-sqlite>=3.0",   # 暂停后跨进程恢复
 ]
 
 [project.optional-dependencies]
