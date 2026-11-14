@@ -27,3 +27,27 @@ def gate_json(g) -> dict:
             "rounds": [{"extraction": extraction_json(r.extraction),
                         "review": r.review and review_json(r.review),
                         "validation": r.validation and validation_json(r.validation)} for r in g.rounds]}
+
+
+def load_extractions(paths) -> list[tuple["ExtractedDocument", list[str]]]:
+    """读取 extract --out 的输出（GateResult 列表）、单个分组或 golden 标注文件。
+
+    返回 (单据, 上游待人工原因)；分组未通过时，原因带给标准化，记录会转人工。
+    目录按文件名排序展开；manifest.json 跳过。
+    """
+    import json
+    from pathlib import Path
+
+    from bill_agent.models import ExtractedDocument
+
+    files = [f for p in map(Path, paths)
+             for f in (sorted(p.glob("*.json")) if p.is_dir() else [p]) if f.name != "manifest.json"]
+    items = []
+    for f in files:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        groups = [{"documents": [data]}] if isinstance(data, dict) and "documents" not in data else (
+            data if isinstance(data, list) else [data])
+        for g in groups:
+            upstream = g.get("reasons", []) if g.get("status", "passed") != "passed" else []
+            items.extend((ExtractedDocument.model_validate(d), list(upstream)) for d in g["documents"])
+    return items

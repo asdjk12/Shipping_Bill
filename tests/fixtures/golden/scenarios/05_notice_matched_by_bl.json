@@ -1,0 +1,57 @@
+{
+  "description": "CMA 到货通知没有单据号：第二份通知金额变化，按提单号 + 费用名 + 币种匹配后 UPDATE",
+  "entity": "PAT",
+  "batches": [
+    {
+      "inputs": [
+        {
+          "golden": "NOTICE_CMA_CMDUCHN4053601"
+        }
+      ]
+    },
+    {
+      "inputs": [
+        {
+          "golden": "NOTICE_CMA_CMDUCHN4053601",
+          "set": {
+            "charges[0].amount": 260.0
+          }
+        }
+      ],
+      "expected": [
+        {
+          "operation": "UPDATE",
+          "document_type": "Other",
+          "reference_no": null,
+          "document_date": "2026-10-19",
+          "bl_nos": [
+            "CMDUCHN4053601"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "SAPU2040689"
+          ],
+          "issuer": "CMA CGM (AMERICA) LLC",
+          "recipient": "NEPTUNE SHIPPING LIMITED",
+          "payee": "CMA CGM (AMERICA) LLC",
+          "payer": null,
+          "charge_item": "OCA17 On Carriage Additional - US Em",
+          "amount": 260.0,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "OCA17 On Carriage Additional - US Em",
+          "line_no": 1,
+          "quantity": null,
+          "unit_price": null,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": 2,
+          "changed_fields": [
+            "amount"
+          ],
+          "needs_review": false
+        }
+      ]
+    }
+  ]
+}

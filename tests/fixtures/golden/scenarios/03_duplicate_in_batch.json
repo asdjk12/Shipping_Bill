@@ -1,0 +1,210 @@
+{
+  "description": "同一批次里同一张 DN 出现两次：第一份 CREATE，第二份与本批次已匹配的记录冲突，转人工",
+  "entity": "PAT",
+  "batches": [
+    {
+      "inputs": [
+        {
+          "golden": "DN_DC-108478"
+        },
+        {
+          "golden": "DN_DC-108478"
+        }
+      ],
+      "expected": [
+        {
+          "operation": "CREATE",
+          "document_type": "Debit Note",
+          "reference_no": "DC-108478",
+          "document_date": "2026-10-24",
+          "bl_nos": [
+            "MAEU275752922",
+            "CGT260801188"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "MRSU2571577",
+            "TCLU8619685"
+          ],
+          "issuer": "NEPTUNE SHIPPING LIMITED",
+          "recipient": null,
+          "payee": "NEPTUNE SHIPPING LIMITED",
+          "payer": null,
+          "charge_item": "Handling Charge",
+          "amount": 65.0,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "HANDLING CHARGE",
+          "line_no": 1,
+          "quantity": 1.0,
+          "unit_price": 65.0,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": false
+        },
+        {
+          "operation": "CREATE",
+          "document_type": "Debit Note",
+          "reference_no": "DC-108478",
+          "document_date": "2026-10-24",
+          "bl_nos": [
+            "MAEU275752922",
+            "CGT260801188"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "MRSU2571577",
+            "TCLU8619685"
+          ],
+          "issuer": "NEPTUNE SHIPPING LIMITED",
+          "recipient": null,
+          "payee": "NEPTUNE SHIPPING LIMITED",
+          "payer": null,
+          "charge_item": "4 ADD'L DETENTION FREE TIME CHARGE",
+          "amount": 1310.4,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "4 ADD'L DETENTION FREE TIME CHARGE",
+          "line_no": 2,
+          "quantity": 1.0,
+          "unit_price": 1310.4,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": false
+        },
+        {
+          "operation": "CREATE",
+          "document_type": "Debit Note",
+          "reference_no": "DC-108478",
+          "document_date": "2026-10-24",
+          "bl_nos": [
+            "MAEU275752922",
+            "CGT260801188"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "MRSU2571577",
+            "TCLU8619685"
+          ],
+          "issuer": "NEPTUNE SHIPPING LIMITED",
+          "recipient": null,
+          "payee": "NEPTUNE SHIPPING LIMITED",
+          "payer": null,
+          "charge_item": "Handling Charge",
+          "amount": 35.0,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "HANDLING CHARGE",
+          "line_no": 3,
+          "quantity": 1.0,
+          "unit_price": 35.0,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": false
+        },
+        {
+          "operation": "PENDING_REVIEW",
+          "document_type": "Debit Note",
+          "reference_no": "DC-108478",
+          "document_date": "2026-10-24",
+          "bl_nos": [
+            "MAEU275752922",
+            "CGT260801188"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "MRSU2571577",
+            "TCLU8619685"
+          ],
+          "issuer": "NEPTUNE SHIPPING LIMITED",
+          "recipient": null,
+          "payee": "NEPTUNE SHIPPING LIMITED",
+          "payer": null,
+          "charge_item": "Handling Charge",
+          "amount": 65.0,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "HANDLING CHARGE",
+          "line_no": 1,
+          "quantity": 1.0,
+          "unit_price": 65.0,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": true
+        },
+        {
+          "operation": "PENDING_REVIEW",
+          "document_type": "Debit Note",
+          "reference_no": "DC-108478",
+          "document_date": "2026-10-24",
+          "bl_nos": [
+            "MAEU275752922",
+            "CGT260801188"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "MRSU2571577",
+            "TCLU8619685"
+          ],
+          "issuer": "NEPTUNE SHIPPING LIMITED",
+          "recipient": null,
+          "payee": "NEPTUNE SHIPPING LIMITED",
+          "payer": null,
+          "charge_item": "4 ADD'L DETENTION FREE TIME CHARGE",
+          "amount": 1310.4,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "4 ADD'L DETENTION FREE TIME CHARGE",
+          "line_no": 2,
+          "quantity": 1.0,
+          "unit_price": 1310.4,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": true
+        },
+        {
+          "operation": "PENDING_REVIEW",
+          "document_type": "Debit Note",
+          "reference_no": "DC-108478",
+          "document_date": "2026-10-24",
+          "bl_nos": [
+            "MAEU275752922",
+            "CGT260801188"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "MRSU2571577",
+            "TCLU8619685"
+          ],
+          "issuer": "NEPTUNE SHIPPING LIMITED",
+          "recipient": null,
+          "payee": "NEPTUNE SHIPPING LIMITED",
+          "payer": null,
+          "charge_item": "Handling Charge",
+          "amount": 35.0,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "HANDLING CHARGE",
+          "line_no": 3,
+          "quantity": 1.0,
+          "unit_price": 35.0,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": true
+        }
+      ]
+    }
+  ]
+}

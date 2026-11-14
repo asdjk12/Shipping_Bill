@@ -355,23 +355,13 @@ def cmd_db_import(args: argparse.Namespace) -> int:
 
 def cmd_apply(args: argparse.Namespace) -> int:
     from bill_agent.billing import BillProcessor, BillRepository, Matcher, PartyNormalizer
-    from bill_agent.models import ExtractedDocument, to_json
+    from bill_agent.extract.serialize import load_extractions
+    from bill_agent.models import to_json
     from bill_agent.normalize import Normalizer
     from bill_agent.rules import EntityMatcher
 
-    files = [f for p in map(Path, args.paths)
-             for f in (sorted(p.glob("*.json")) if p.is_dir() else [p]) if f.name != "manifest.json"]
     normalizer = Normalizer()
-    items = []
-    for f in files:
-        data = json.loads(f.read_text(encoding="utf-8"))
-        groups = [{"documents": [data]}] if isinstance(data, dict) and "documents" not in data else (
-            data if isinstance(data, list) else [data])
-        for g in groups:
-            upstream = g.get("reasons", []) if g.get("status", "passed") != "passed" else []
-            for d in g["documents"]:
-                doc = ExtractedDocument.model_validate(d)
-                items.append((doc, normalizer.normalize_document(doc, upstream)))
+    items = [(doc, normalizer.normalize_document(doc, upstream)) for doc, upstream in load_extractions(args.paths)]
 
     with BillRepository(args.db) as repo:
         processor = BillProcessor(repo, Matcher(repo, PartyNormalizer.load()), EntityMatcher.load(args.entity),
@@ -568,6 +558,55 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return _run_graph(run, Command(resume=decisions), args.checkpoint)
 
 
+def cmd_golden_eval(args: argparse.Namespace) -> int:
+    from bill_agent.extract.serialize import load_extractions
+    from bill_agent.harness.golden import Comparison, load_scenarios, run_scenario, write_expected
+
+    scenarios = load_scenarios(Path(args.golden_dir))
+    if args.scenario:
+        scenarios = [s for s in scenarios if any(k in s.name for k in args.scenario)]
+    first_batch = None
+    if args.extracted:
+        # 真实抽取结果只替换第一个场景的第一个批次（空库首次导入），其余场景依赖人工改写的 golden，不适用
+        first_batch = load_extractions(args.extracted)
+        scenarios = scenarios[:1]
+    total = Comparison()
+    for sc in scenarios:
+        results = run_scenario(sc, Path(args.samples_dir), first_batch)
+        print(f"\n== {sc.name}：{sc.description}")
+        for i, r in enumerate(results, 1):
+            ops = " ".join(a["operation"] for a in r.actual)
+            if r.comparison is None:
+                print(f"  批次 {i}（准备）：{ops}")
+                continue
+            c = r.comparison
+            total.merge(c)
+            print(f"  批次 {i}：{ops}  ->  {c.fields - len(c.diffs)} / {c.fields} 个字段一致"
+                  + ("" if c.ok else "  ✗"))
+            for d in c.diffs:
+                print(f"    ✗ {d.key} {d.field}: 期望 {d.expected!r}，实际 {d.actual!r}")
+            for m in c.missing:
+                print(f"    ✗ 缺少记录 {m['reference_no'] or m['bl_nos']} 第 {m['line_no']} 行 {m['original_charge_item']!r}")
+            for x in c.extra:
+                print(f"    ? 多出记录 {x['reference_no'] or x['bl_nos']} 第 {x['line_no']} 行 {x['original_charge_item']!r}")
+        if args.update and not args.extracted:
+            write_expected(sc, results)
+            print(f"  已把实际输出写为期望：{sc.path}（提交前人工核对 diff）")
+
+    print("\n按字段：")
+    for name, (good, n) in total.per_field.items():
+        print(f"  {name:22} {good:3} / {n:<3} {good / n:6.1%}")
+    print(f"\n总计 {total.fields - len(total.diffs)} / {total.fields} 个字段一致；"
+          f"缺少 {len(total.missing)} 条，多出 {len(total.extra)} 条")
+    if args.out:
+        _write_json(args.out, {"fields": total.fields, "per_field": total.per_field,
+                               "diffs": [vars(d) for d in total.diffs],
+                               "missing": total.missing, "extra": total.extra})
+    # --extracted 时多出的记录（没有 golden 的单据，如 EML）只提示，不算失败
+    failed = total.diffs or total.missing or (total.extra and not args.extracted)
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bill_agent")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -663,6 +702,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-retries", type=int, default=3)
     p.add_argument("--out", help="输出对比明细 JSON 的路径")
     p.set_defaults(func=cmd_extract_eval)
+
+    p = sub.add_parser("golden-eval", help="Golden 回归：场景输入 -> 期望输出逐字段对比（默认不调用 LLM）")
+    p.add_argument("--golden-dir", default="tests/fixtures/golden", help="scenarios/ 所在目录")
+    p.add_argument("--samples-dir", default="tests/fixtures/samples", help="golden 抽取标注所在目录")
+    p.add_argument("--scenario", action="append", help="只跑名称包含该字符串的场景，可重复")
+    p.add_argument("--extracted", nargs="+",
+                   help="用 extract --out 的真实抽取结果替换第一个场景的输入，评测端到端准确率")
+    p.add_argument("--update", action="store_true", help="把实际输出写成期望（需人工核对后提交）")
+    p.add_argument("--out", help="输出对比明细 JSON 的路径")
+    p.set_defaults(func=cmd_golden_eval)
 
     p = sub.add_parser("review-eval", parents=[common], help="评测审核模型的误报和发现能力")
     p.add_argument("--samples-dir", required=True, help="题目测试集原件所在目录")

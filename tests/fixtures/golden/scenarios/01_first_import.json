@@ -1,0 +1,207 @@
+{
+  "description": "空账单库导入题目的 3 份收费单据：每个费用行 CREATE；样例里 PAT 不是交易任何一方，posting_type 为 null",
+  "entity": "PAT",
+  "batches": [
+    {
+      "inputs": [
+        {
+          "golden": "DN_DC-108478"
+        },
+        {
+          "golden": "INV_ZIM_ORFR1618731"
+        },
+        {
+          "golden": "NOTICE_CMA_CMDUCHN4053601"
+        }
+      ],
+      "expected": [
+        {
+          "operation": "CREATE",
+          "document_type": "Debit Note",
+          "reference_no": "DC-108478",
+          "document_date": "2026-10-24",
+          "bl_nos": [
+            "MAEU275752922",
+            "CGT260801188"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "MRSU2571577",
+            "TCLU8619685"
+          ],
+          "issuer": "NEPTUNE SHIPPING LIMITED",
+          "recipient": null,
+          "payee": "NEPTUNE SHIPPING LIMITED",
+          "payer": null,
+          "charge_item": "Handling Charge",
+          "amount": 65.0,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "HANDLING CHARGE",
+          "line_no": 1,
+          "quantity": 1.0,
+          "unit_price": 65.0,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": false
+        },
+        {
+          "operation": "CREATE",
+          "document_type": "Debit Note",
+          "reference_no": "DC-108478",
+          "document_date": "2026-10-24",
+          "bl_nos": [
+            "MAEU275752922",
+            "CGT260801188"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "MRSU2571577",
+            "TCLU8619685"
+          ],
+          "issuer": "NEPTUNE SHIPPING LIMITED",
+          "recipient": null,
+          "payee": "NEPTUNE SHIPPING LIMITED",
+          "payer": null,
+          "charge_item": "4 ADD'L DETENTION FREE TIME CHARGE",
+          "amount": 1310.4,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "4 ADD'L DETENTION FREE TIME CHARGE",
+          "line_no": 2,
+          "quantity": 1.0,
+          "unit_price": 1310.4,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": false
+        },
+        {
+          "operation": "CREATE",
+          "document_type": "Debit Note",
+          "reference_no": "DC-108478",
+          "document_date": "2026-10-24",
+          "bl_nos": [
+            "MAEU275752922",
+            "CGT260801188"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "MRSU2571577",
+            "TCLU8619685"
+          ],
+          "issuer": "NEPTUNE SHIPPING LIMITED",
+          "recipient": null,
+          "payee": "NEPTUNE SHIPPING LIMITED",
+          "payer": null,
+          "charge_item": "Handling Charge",
+          "amount": 35.0,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "HANDLING CHARGE",
+          "line_no": 3,
+          "quantity": 1.0,
+          "unit_price": 35.0,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": false
+        },
+        {
+          "operation": "CREATE",
+          "document_type": "Invoice",
+          "reference_no": "ORFR1618731",
+          "document_date": "2025-10-03",
+          "bl_nos": [
+            "ZIMUNGB1312144"
+          ],
+          "booking_no": "ZIMUNGB1312144",
+          "container_nos": [
+            "JXLU4504463"
+          ],
+          "issuer": "ZIM AMERICAN INTEGRATED SHIPPING SERVICES CO. LLC",
+          "recipient": "ALL AMERICA FORWARDING, INC.",
+          "payee": "Zim American Integrated Shipping Services Co., LLC",
+          "payer": "USIAHALLAM",
+          "charge_item": "WHARFAGE ADMINISTRATION FEE",
+          "amount": 5.0,
+          "currency": "USD",
+          "payment_term": null,
+          "original_charge_item": "WHARFAGE ADMINISTRATION FEE",
+          "line_no": 1,
+          "quantity": null,
+          "unit_price": 5.0,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": false
+        },
+        {
+          "operation": "CREATE",
+          "document_type": "Invoice",
+          "reference_no": "ORFR1618731",
+          "document_date": "2025-10-03",
+          "bl_nos": [
+            "ZIMUNGB1312144"
+          ],
+          "booking_no": "ZIMUNGB1312144",
+          "container_nos": [
+            "JXLU4504463"
+          ],
+          "issuer": "ZIM AMERICAN INTEGRATED SHIPPING SERVICES CO. LLC",
+          "recipient": "ALL AMERICA FORWARDING, INC.",
+          "payee": "Zim American Integrated Shipping Services Co., LLC",
+          "payer": "USIAHALLAM",
+          "charge_item": "WHARFAGE",
+          "amount": 21.9,
+          "currency": "USD",
+          "payment_term": null,
+          "original_charge_item": "WHARFAGE",
+          "line_no": 2,
+          "quantity": null,
+          "unit_price": 2.85,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": false
+        },
+        {
+          "operation": "CREATE",
+          "document_type": "Other",
+          "reference_no": null,
+          "document_date": "2026-10-19",
+          "bl_nos": [
+            "CMDUCHN4053601"
+          ],
+          "booking_no": null,
+          "container_nos": [
+            "SAPU2040689"
+          ],
+          "issuer": "CMA CGM (AMERICA) LLC",
+          "recipient": "NEPTUNE SHIPPING LIMITED",
+          "payee": "CMA CGM (AMERICA) LLC",
+          "payer": null,
+          "charge_item": "OCA17 On Carriage Additional - US Em",
+          "amount": 245.0,
+          "currency": "USD",
+          "payment_term": "CC",
+          "original_charge_item": "OCA17 On Carriage Additional - US Em",
+          "line_no": 1,
+          "quantity": null,
+          "unit_price": null,
+          "accounting_entity": "PAT",
+          "posting_type": null,
+          "matched_rule": null,
+          "changed_fields": [],
+          "needs_review": false
+        }
+      ]
+    }
+  ]
+}
